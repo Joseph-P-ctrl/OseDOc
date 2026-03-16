@@ -52,6 +52,38 @@ python osinergmin_auth.py
 
 Tambien puedes sobreescribir por CLI si lo necesitas.
 
+## Visualizacion Web (FastAPI)
+
+Se agrego un servicio web para visualizar el listado guardado en SQLite y abrir los documentos descargados.
+
+### 1. Generar data (Excel + SQLite + documentos)
+
+```bash
+python osinergmin_auth.py
+```
+
+Esto genera/actualiza:
+
+- `downloads/notificaciones.db`
+- `downloads/YYYY-MM-DD/<Nro. Notificacion>/...`
+
+### 2. Levantar el servicio web
+
+```bash
+python -m uvicorn web_app:app --host 127.0.0.1 --port 8000
+```
+
+### 3. Abrir en navegador
+
+- `http://127.0.0.1:8000/` listado completo
+- `http://127.0.0.1:8000/health` estado del servicio
+
+### Variables opcionales
+
+- `OSI_SQLITE_PATH` ruta del archivo SQLite (default: `downloads/notificaciones.db`)
+- `OSI_DOWNLOAD_DIR` carpeta base de descargas (default: `downloads`)
+- `OSI_WEB_PAGE_SIZE` tamaño de pagina para el listado (default: `50`)
+
 ## Siguiente paso
 
 Con esta base de autenticacion lista, se puede acoplar la extraccion de documentos filtrados y descargas.
