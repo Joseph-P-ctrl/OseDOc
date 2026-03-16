@@ -218,9 +218,24 @@ def _new_driver(cfg: AuthConfig):
             "download.prompt_for_download": False,
             "download.directory_upgrade": True,
             "safebrowsing.enabled": True,
+            # Evita el popup "Descargar varios archivos" (Permitir/Bloquear).
+            "profile.default_content_setting_values.automatic_downloads": 1,
         },
     )
-    return webdriver.Chrome(options=options)
+    driver = webdriver.Chrome(options=options)
+    try:
+        driver.execute_cdp_cmd(
+            "Browser.setDownloadBehavior",
+            {
+                "behavior": "allow",
+                "downloadPath": str(download_path),
+                "eventsEnabled": False,
+            },
+        )
+    except Exception:
+        # No bloquea el flujo si esta capacidad no esta disponible.
+        pass
+    return driver
 
 
 def _find_first(driver, selectors: list[tuple[str, str]], timeout: int):
@@ -1113,13 +1128,15 @@ def _move_download_to_notification_folder(file_path: Path, base_download_dir: Pa
 
 
 def _get_notifications_with_downloads(base_download_dir: Path) -> set[str]:
-    """Obtiene Nro. Notificacion que ya tienen archivos descargados en cualquier fecha."""
+    """Obtiene Nro. Notificacion que ya tienen archivos descargados en la carpeta de HOY.
+    Solo revisa la subcarpeta del dia actual para que cada dia se vuelva a descargar todo."""
     existing: set[str] = set()
     pattern = re.compile(r"\d{8,}-\d+")
-    if not base_download_dir.exists():
+    today_folder = base_download_dir / datetime.now().strftime("%Y-%m-%d")
+    if not today_folder.exists():
         return existing
 
-    for candidate in base_download_dir.rglob("*"):
+    for candidate in today_folder.iterdir():
         if not candidate.is_dir() or not pattern.fullmatch(candidate.name):
             continue
         try:
@@ -1133,8 +1150,9 @@ def _get_notifications_with_downloads(base_download_dir: Path) -> set[str]:
 
 
 def _normalize_exported_excel_file(download_dir: Path, downloaded_file: Path) -> Path:
-    """Deja un solo Excel de exportacion con nombre fijo y elimina copias (1), (2), ..."""
-    canonical = download_dir / "Notificaciones Electrónicas.xlsx"
+    """Deja un Excel de exportacion con nombre de la fecha actual y elimina copias (1), (2), ..."""
+    today_date = datetime.now().strftime("%Y-%m-%d")
+    canonical = download_dir / f"Notificaciones Electrónicas - {today_date}.xlsx"
 
     try:
         if downloaded_file.resolve() != canonical.resolve():

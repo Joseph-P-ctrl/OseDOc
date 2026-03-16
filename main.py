@@ -1,6 +1,9 @@
-def main():
-    print("Hello from osidoc!")
+from app_entry import run
+
+
+def main() -> int:
+    return run()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

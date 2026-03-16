@@ -52,6 +52,17 @@ python osinergmin_auth.py
 
 Tambien puedes sobreescribir por CLI si lo necesitas.
 
+### Entrada simplificada (main)
+
+Ahora `main.py` solo actua como wrapper y delega la logica al nuevo archivo `app_entry.py`.
+
+Comandos disponibles:
+
+```bash
+python main.py sync
+python main.py web --host 127.0.0.1 --port 8010
+```
+
 ## Visualizacion Web (FastAPI)
 
 Se agrego un servicio web para visualizar el listado guardado en SQLite y abrir los documentos descargados.

@@ -8,11 +8,19 @@ import subprocess
 import threading
 import time
 import unicodedata
+from collections import Counter
+from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+
+try:
+  from pypdf import PdfReader
+except Exception:
+  PdfReader = None
 
 WORKSPACE_DIR = Path(__file__).resolve().parent
 
@@ -55,50 +63,79 @@ COLUMNS_TO_DISPLAY = [
     "fecha_importacion",
 ]
 
-UPDATE_STATE = {"running": False, "progress": 0, "error": None, "message": ""}
+UPDATE_STATE = {
+  "running": False,
+  "progress": 0,
+  "error": None,
+  "message": "",
+  "started_at": None,
+  "recent_downloads": [],
+}
 
 
 def _run_update():
-    """Ejecuta osinergmin_auth.py en thread separado."""
-    try:
-        UPDATE_STATE["running"] = True
-        UPDATE_STATE["error"] = None
-        UPDATE_STATE["message"] = "Iniciando actualización incremental..."
-        UPDATE_STATE["progress"] = 10
+  """Ejecuta osinergmin_auth.py en thread separado."""
+  try:
+    UPDATE_STATE["running"] = True
+    UPDATE_STATE["error"] = None
+    UPDATE_STATE["message"] = "Iniciando actualización incremental..."
+    UPDATE_STATE["progress"] = 10
+    UPDATE_STATE["started_at"] = time.time()
+    UPDATE_STATE["recent_downloads"] = []
 
-        script_path = WORKSPACE_DIR / "osinergmin_auth.py"
-        result = subprocess.run(
-            [
-                str(WORKSPACE_DIR / ".venv" / "Scripts" / "python.exe"),
-                str(script_path),
-                "--incremental-only",
-                "--skip-existing-notifications",
-            ],
-            cwd=str(WORKSPACE_DIR),
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+    script_path = WORKSPACE_DIR / "osinergmin_auth.py"
+    result = subprocess.run(
+      [
+        str(WORKSPACE_DIR / ".venv" / "Scripts" / "python.exe"),
+        str(script_path),
+        "--incremental-only",
+        "--skip-existing-notifications",
+      ],
+      cwd=str(WORKSPACE_DIR),
+      capture_output=True,
+      text=True,
+      timeout=600,
+    )
 
-        combined_output = (result.stdout or "") + "\n" + (result.stderr or "")
+    combined_output = (result.stdout or "") + "\n" + (result.stderr or "")
+    moved_files = re.findall(
+      r"Archivo movido\s+.*?:\s*(.+?)(?:\s+\(\d+\s+bytes\))?\s*$",
+      combined_output,
+      flags=re.MULTILINE,
+    )
+    unique_recent_downloads = list(dict.fromkeys([m.strip() for m in moved_files if m and m.strip()]))
+    UPDATE_STATE["recent_downloads"] = unique_recent_downloads[:20]
 
-        if result.returncode == 0:
-            UPDATE_STATE["progress"] = 100
-            if "No hay notificaciones nuevas o pendientes por descargar." in combined_output:
-                UPDATE_STATE["message"] = "No hay nada nuevo para descargar."
-            elif "No se descargaron documentos notificados." in combined_output:
-                UPDATE_STATE["message"] = "No hubo documentos nuevos para descargar."
-            else:
-                UPDATE_STATE["message"] = "Actualización completada."
-        else:
-            UPDATE_STATE["error"] = f"Proceso finalizado con código {result.returncode}"
-            UPDATE_STATE["message"] = "La actualización terminó con error."
-    except Exception as e:
-        UPDATE_STATE["error"] = str(e)
-        UPDATE_STATE["progress"] = 0
-        UPDATE_STATE["message"] = "Error durante la actualización."
-    finally:
-        UPDATE_STATE["running"] = False
+    if result.returncode == 0:
+      UPDATE_STATE["progress"] = 100
+      if "No hay notificaciones nuevas o pendientes por descargar." in combined_output:
+        UPDATE_STATE["message"] = "No hay nada nuevo para descargar."
+      elif "No se descargaron documentos notificados." in combined_output:
+        UPDATE_STATE["message"] = "No hubo documentos nuevos para descargar."
+      elif unique_recent_downloads:
+        UPDATE_STATE["message"] = f"Actualización completada. Se descargaron {len(unique_recent_downloads)} documento(s)."
+      else:
+        UPDATE_STATE["message"] = "Actualización completada."
+    else:
+      UPDATE_STATE["error"] = f"Proceso finalizado con código {result.returncode}"
+      UPDATE_STATE["message"] = "La actualización terminó con error."
+  except Exception as e:
+    UPDATE_STATE["error"] = str(e)
+    UPDATE_STATE["progress"] = 0
+    UPDATE_STATE["message"] = "Error durante la actualización."
+  finally:
+    _build_notification_files_metadata.cache_clear()
+    UPDATE_STATE["running"] = False
+    UPDATE_STATE["started_at"] = None
+
+
+@app.on_event("startup")
+async def _auto_sync_on_startup():
+    """Descarga automáticamente al abrir la app si la carpeta de hoy no existe todavía."""
+    today_folder = DOWNLOADS_DIR / datetime.now().strftime("%Y-%m-%d")
+    if not today_folder.exists() and not UPDATE_STATE["running"]:
+        thread = threading.Thread(target=_run_update, daemon=True)
+        thread.start()
 
 
 def _connect() -> sqlite3.Connection:
@@ -138,18 +175,278 @@ def _normalize_text(value: str) -> str:
 
 def _infer_document_type(text: str) -> str:
   t = _normalize_text(text)
+  if not t:
+    return "No identificado"
 
-  if "coactiva" in t or "cobranza" in t:
+  # Prioridad alta: tipos mas especificos.
+  if any(k in t for k in [
+    "cobranza coactiva",
+    "coactiva",
+    "ejecutor coactivo",
+    "ejecucion coactiva",
+    "medida cautelar",
+  ]):
     return "Cobranza coactiva"
-  if "resolucion" in t:
-    return "Resolucion"
-  if "requerimiento" in t:
+
+  if any(k in t for k in [
+    "requerimiento",
+    "requerir",
+    "se requiere",
+    "subsanar",
+    "cumplimiento",
+    "plazo otorgado",
+  ]):
     return "Requerimiento"
-  if "oficio" in t:
+
+  if any(k in t for k in [
+    "oficio",
+    "carta",
+    "of.",
+    "oficio multiple",
+  ]):
     return "Oficio"
-  if "informe" in t:
+
+  if any(k in t for k in [
+    "informe",
+    "informe tecnico",
+    "reporte tecnico",
+    "dictamen",
+    "memorando",
+  ]):
     return "Informe"
-  return "No identificado"
+
+  if any(k in t for k in [
+    "resolucion",
+    "resuelve",
+    "resolutiva",
+    "apelacion",
+    "recurso",
+    "queja",
+    "pronunciamiento",
+    "sancion",
+    "multa",
+    "acto administrativo",
+  ]):
+    return "Resolucion"
+
+  # Fallback para documentos administrativos sin palabra clave explicita.
+  return "Resolucion"
+
+
+def _extract_pdf_text(path: Path, max_pages: int | None = None, max_chars: int = 200000) -> str:
+  """Extrae texto del PDF para inferir metadata de forma mas completa."""
+  if PdfReader is None:
+    return ""
+
+  try:
+    reader = PdfReader(str(path))
+    parts: list[str] = []
+    pages = reader.pages if max_pages is None else reader.pages[:max_pages]
+    for page in pages:
+      text = page.extract_text() or ""
+      if text:
+        parts.append(text)
+    joined = "\n".join(parts)
+    if len(joined) > max_chars:
+      return joined[:max_chars]
+    return joined
+  except Exception:
+    return ""
+
+
+def _normalize_due_candidate(candidate: str) -> str:
+  token = re.sub(r"\s+", " ", candidate.strip())
+  token = token.replace(".", "/").replace("-", "/")
+
+  m_num = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{2,4})$", token)
+  if m_num:
+    d, m, y = int(m_num.group(1)), int(m_num.group(2)), int(m_num.group(3))
+    if y < 100:
+      y += 2000
+    try:
+      return datetime(y, m, d).strftime("%d/%m/%Y")
+    except ValueError:
+      return ""
+
+  month_map = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "setiembre": 9,
+    "septiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+  }
+  m_txt = re.match(r"^(\d{1,2})\s+de\s+([a-z]+)\s+de\s+(\d{4})$", token)
+  if m_txt:
+    d = int(m_txt.group(1))
+    month_name = m_txt.group(2)
+    y = int(m_txt.group(3))
+    month_number = month_map.get(month_name)
+    if month_number:
+      try:
+        return datetime(y, month_number, d).strftime("%d/%m/%Y")
+      except ValueError:
+        return ""
+  return ""
+
+
+def _extract_due_date(text: str) -> str:
+  """Busca fecha de vencimiento contextual en texto libre y normaliza a dd/mm/yyyy."""
+  raw = _normalize_text(text)
+  compact = re.sub(r"\s+", " ", raw)
+
+  months = r"enero|febrero|marzo|abril|mayo|junio|julio|agosto|setiembre|septiembre|octubre|noviembre|diciembre"
+  date_num = r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})"
+  date_txt = rf"(\d{{1,2}}\s+de\s+(?:{months})\s+de\s+\d{{4}})"
+
+  patterns = [
+    rf"fecha\s+de\s+vencimiento\s*[:\-]?\s*{date_num}",
+    rf"fecha\s+de\s+vencimiento\s*[:\-]?\s*{date_txt}",
+    rf"vencimiento\s*[:\-]?\s*{date_num}",
+    rf"vencimiento\s*[:\-]?\s*{date_txt}",
+    rf"vence\s*(?:el)?\s*[:\-]?\s*{date_num}",
+    rf"vence\s*(?:el)?\s*[:\-]?\s*{date_txt}",
+    rf"plazo\s+(?:maximo\s+)?(?:hasta|vence)\s*(?:el)?\s*{date_num}",
+    rf"plazo\s+(?:maximo\s+)?(?:hasta|vence)\s*(?:el)?\s*{date_txt}",
+    rf"tiene\s+plazo\s+hasta\s+el\s*{date_num}",
+    rf"tiene\s+plazo\s+hasta\s+el\s*{date_txt}",
+  ]
+
+  for pat in patterns:
+    m = re.search(pat, compact)
+    if not m:
+      continue
+    normalized = _normalize_due_candidate(m.group(1))
+    if normalized:
+      return normalized
+  return ""
+
+
+def _extract_deadline_days(text: str) -> int | None:
+  """Extrae plazo en dias cuando no hay fecha de vencimiento explicita."""
+  raw = re.sub(r"\s+", " ", _normalize_text(text))
+  patterns = [
+    r"plazo\s+de\s+(\d{1,3})\s+dias",
+    r"en\s+el\s+plazo\s+de\s+(\d{1,3})\s+dias",
+    r"dentro\s+de\s+(\d{1,3})\s+dias",
+    r"cuenta\s+con\s+(\d{1,3})\s+dias",
+    r"otorga\w*\s+un\s+plazo\s+de\s+(\d{1,3})\s+dias",
+  ]
+  values: list[int] = []
+  for pat in patterns:
+    for found in re.findall(pat, raw):
+      try:
+        day_count = int(found)
+      except ValueError:
+        continue
+      if 1 <= day_count <= 365:
+        values.append(day_count)
+  return min(values) if values else None
+
+
+def _parse_notification_date(value: str) -> datetime | None:
+  token = (value or "").strip()
+  if not token:
+    return None
+
+  formats = [
+    "%d/%m/%Y %I:%M:%S %p",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d",
+  ]
+  for fmt in formats:
+    try:
+      return datetime.strptime(token, fmt)
+    except ValueError:
+      continue
+
+  m_dmy = re.search(r"(\d{2}/\d{2}/\d{4})", token)
+  if m_dmy:
+    try:
+      return datetime.strptime(m_dmy.group(1), "%d/%m/%Y")
+    except ValueError:
+      pass
+
+  m_ymd = re.search(r"(\d{4}-\d{2}-\d{2})", token)
+  if m_ymd:
+    try:
+      return datetime.strptime(m_ymd.group(1), "%Y-%m-%d")
+    except ValueError:
+      pass
+  return None
+
+
+def _to_datetime(date_text: str) -> datetime | None:
+  try:
+    return datetime.strptime(date_text, "%d/%m/%Y")
+  except Exception:
+    return None
+
+
+@lru_cache(maxsize=1024)
+def _build_notification_files_metadata(numero: str) -> list[dict[str, str]]:
+  docs = sorted(DOWNLOADS_DIR.glob(f"*/{numero}/*"), key=lambda p: p.name.lower())
+  files: list[dict[str, str]] = []
+  for path in docs:
+    relative = path.relative_to(DOWNLOADS_DIR).as_posix()
+    href = f"/files/{quote(relative)}"
+    date_folder = path.parents[1].name if len(path.parents) > 1 else ""
+    try:
+      size_kb = f"{path.stat().st_size / 1024:.2f}"
+    except OSError:
+      size_kb = "0.00"
+
+    pdf_text = _extract_pdf_text(path)
+    searchable = f"{path.name}\n{pdf_text}"
+    doc_type_from_name = _infer_document_type(path.name)
+    final_doc_type = doc_type_from_name if doc_type_from_name != "No identificado" else _infer_document_type(searchable)
+    deadline_days = _extract_deadline_days(searchable)
+    files.append(
+      {
+        "name": path.name,
+        "href": href,
+        "date_folder": date_folder,
+        "size_kb": size_kb,
+        "document_type": final_doc_type,
+        "due_date": _extract_due_date(searchable),
+        "deadline_days": str(deadline_days) if deadline_days is not None else "",
+      }
+    )
+  return files
+
+
+def _summarize_notification_metadata(numero: str, fallback_text: str = "", notification_date_text: str = "") -> tuple[str, str]:
+  files = _build_notification_files_metadata(numero)
+  due_dates = [f.get("due_date", "") for f in files if f.get("due_date")]
+  parsed = [d for d in (_to_datetime(v) for v in due_dates) if d is not None]
+  due_value = min(parsed).strftime("%d/%m/%Y") if parsed else ""
+
+  if not due_value:
+    notif_dt = _parse_notification_date(notification_date_text)
+    days_candidates: list[int] = []
+    for f in files:
+      day_text = (f.get("deadline_days") or "").strip()
+      if day_text.isdigit():
+        days_candidates.append(int(day_text))
+    if notif_dt and days_candidates:
+      estimated_dt = notif_dt + timedelta(days=min(days_candidates))
+      due_value = f"{estimated_dt.strftime('%d/%m/%Y')} (estimado)"
+
+  types = [f.get("document_type", "") for f in files if f.get("document_type") and f.get("document_type") != "No identificado"]
+  if types:
+    doc_type = Counter(types).most_common(1)[0][0]
+  else:
+    doc_type = _infer_document_type(fallback_text)
+  return due_value, doc_type
 
 
 def _notifications_with_files(base_dir: Path) -> set[str]:
@@ -207,6 +504,26 @@ def _remote_check_required() -> tuple[bool, int | None]:
     return minutes >= REMOTE_CHECK_STALE_MINUTES, minutes
 
 
+def _head_actions_html() -> str:
+    return """
+    <div class="head-actions">
+      <div class="notif-wrap">
+        <button type="button" class="btn bell-btn" onclick="toggleNotificationCenter(event)" aria-label="Notificaciones">
+          <span class="bell-icon">&#128276;</span>
+          <span id="bellBadge" class="bell-badge" style="display:none;">0</span>
+        </button>
+        <div id="notificationPanel" class="notif-panel">
+          <div class="notif-title">Notificaciones</div>
+          <ul id="notificationList" class="notif-list">
+            <li class="muted">Sin notificaciones por ahora.</li>
+          </ul>
+        </div>
+      </div>
+      <button class="btn refresh" onclick="abrirActualizacion(event)"><span class="spinner"></span>Actualizar</button>
+    </div>
+    """
+
+
 def _html_page(title: str, body: str) -> HTMLResponse:
     page = f"""<!doctype html>
 <html lang=\"es\">
@@ -257,6 +574,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     }}
     .head > div:first-child {{ flex: 1; }}
     .head h1 {{ margin: 0; font-size: 24px; font-weight: 700; letter-spacing: 0.2px; }}
+    .head-actions {{ display: inline-flex; align-items: center; gap: 10px; }}
     .meta {{ font-size: 13px; opacity: 0.92; margin-top: 6px; }}
     .content {{ padding: 20px; }}
     .toolbar {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }}
@@ -309,6 +627,62 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       font-weight: 600;
     }}
     .btn.refresh:hover {{ background: linear-gradient(110deg, #188a4a, #2eab63); }}
+    .notif-wrap {{ position: relative; }}
+    .bell-btn {{
+      position: relative;
+      background: rgba(255,255,255,0.16);
+      border: 1px solid rgba(255,255,255,0.28);
+      padding: 10px 12px;
+      min-width: 46px;
+      justify-content: center;
+    }}
+    .bell-btn:hover {{ background: rgba(255,255,255,0.26); }}
+    .bell-icon {{ font-size: 18px; line-height: 1; }}
+    .bell-badge {{
+      position: absolute;
+      top: -6px;
+      right: -6px;
+      min-width: 20px;
+      height: 20px;
+      border-radius: 999px;
+      background: #ff5f6d;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 6px;
+      border: 2px solid #ffffff;
+    }}
+    .notif-panel {{
+      position: absolute;
+      top: calc(100% + 10px);
+      right: 0;
+      width: min(420px, 86vw);
+      max-height: 340px;
+      overflow: auto;
+      background: #ffffff;
+      color: var(--ink);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      box-shadow: 0 18px 34px rgba(9, 29, 51, 0.24);
+      padding: 10px;
+      display: none;
+      z-index: 1300;
+    }}
+    .notif-panel.open {{ display: block; }}
+    .notif-title {{ font-weight: 700; font-size: 14px; margin: 2px 2px 8px; color: #0b3f76; }}
+    .notif-list {{ list-style: none; padding: 0; margin: 0; }}
+    .notif-list li {{
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      border: 1px solid #e8eef7;
+      margin-bottom: 7px;
+      background: #f8fbff;
+    }}
+    .notif-list li strong {{ color: #0b3f76; }}
     .spinner {{
       display: inline-block;
       width: 14px;
@@ -450,6 +824,23 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     .floating-alert.show {{ display: block; }}
     .floating-alert.pending {{ background: #fff6e8; color: #9a5b00; border-color: #f2d39a; }}
     .floating-alert.check {{ background: #f6f2ff; color: #4d3b8f; border-color: #d8cbf7; }}
+    .fa-close {{
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 24px;
+      padding: 0;
+      opacity: 0.75;
+    }}
+    .fa-close:hover {{ opacity: 1; background: rgba(0, 0, 0, 0.08); }}
     .fa-title {{ font-weight: 700; margin-bottom: 6px; }}
     .fa-text {{ font-size: 13px; line-height: 1.4; }}
     .fa-actions {{ margin-top: 10px; text-align: right; }}
@@ -466,6 +857,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     </div>
   </div>
   <div id="floatingAlert" class="floating-alert" aria-live="polite">
+    <button type="button" class="fa-close" aria-label="Cerrar alerta" onclick="closeFloatingAlert()">&times;</button>
     <div class="fa-title" id="floatingAlertTitle">Estado de descargas</div>
     <div class="fa-text" id="floatingAlertText">Verificando pendientes...</div>
     <div class="fa-actions">
@@ -473,6 +865,68 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     </div>
   </div>
   <script>
+    const bellState = {{ items: [], keys: new Set(), pendingCount: 0 }};
+
+    function nowLabel() {{
+      const d = new Date();
+      return d.toLocaleTimeString('es-PE', {{ hour: '2-digit', minute: '2-digit' }});
+    }}
+
+    function pushNotification(text, level = 'info') {{
+      const clean = (text || '').trim();
+      if (!clean) return;
+      const key = `${{level}}|${{clean}}`;
+      if (bellState.keys.has(key)) return;
+      bellState.keys.add(key);
+      bellState.items.unshift({{ text: clean, level, time: nowLabel() }});
+      if (bellState.items.length > 40) bellState.items = bellState.items.slice(0, 40);
+      renderNotificationCenter();
+    }}
+
+    function renderNotificationCenter() {{
+      const list = document.getElementById('notificationList');
+      const badge = document.getElementById('bellBadge');
+      if (!list || !badge) return;
+
+      if (!bellState.items.length) {{
+        list.innerHTML = '<li class="muted">Sin notificaciones por ahora.</li>';
+      }} else {{
+        list.innerHTML = bellState.items.map((n) => (
+          `<li><strong>${{n.time}}</strong> · ${{n.text}}</li>`
+        )).join('');
+      }}
+
+      const count = bellState.pendingCount > 0 ? bellState.pendingCount : bellState.items.length;
+      if (count > 0) {{
+        badge.style.display = 'inline-flex';
+        badge.textContent = String(Math.min(count, 99));
+      }} else {{
+        badge.style.display = 'none';
+      }}
+    }}
+
+    function toggleNotificationCenter(evt) {{
+      if (evt) evt.stopPropagation();
+      const panel = document.getElementById('notificationPanel');
+      if (!panel) return;
+      panel.classList.toggle('open');
+    }}
+
+    document.addEventListener('click', (evt) => {{
+      const panel = document.getElementById('notificationPanel');
+      const wrap = evt.target && evt.target.closest ? evt.target.closest('.notif-wrap') : null;
+      if (panel && !wrap) panel.classList.remove('open');
+    }});
+
+    let floatingAlertDismissed = false;
+    let floatingAlertStateSignature = '';
+
+    function closeFloatingAlert() {{
+      floatingAlertDismissed = true;
+      const box = document.getElementById('floatingAlert');
+      if (box) box.classList.remove('show');
+    }}
+
     async function abrirActualizacion(evt) {{
       const modal = document.getElementById('updateModal');
       const btn = (evt && evt.target && evt.target.closest('button'))
@@ -488,16 +942,27 @@ def _html_page(title: str, body: str) -> HTMLResponse:
         if(data.success) {{
           const checkInterval = setInterval(async () => {{
             const status = await fetch('/api/estado').then(r => r.json());
-            document.getElementById('updateProgress').textContent = `Descargando... ${{Math.min(status.progress || 0, 99)}}%`;
+            const shownProgress = status.running
+              ? Math.min(status.progress || 0, 99)
+              : 100;
+            document.getElementById('updateProgress').textContent = `Descargando... ${{shownProgress}}%`;
             
             if(!status.running) {{
               clearInterval(checkInterval);
-              document.getElementById('updateProgress').textContent = status.message || '¡Completado! Recargando...';
+              if (Array.isArray(status.recent_downloads) && status.recent_downloads.length > 0) {{
+                status.recent_downloads.forEach((name) => pushNotification(`Se ha descargado: ${{name}}`, 'download'));
+              }} else {{
+                pushNotification(status.message || 'Actualización finalizada.', 'status');
+              }}
+              document.getElementById('updateProgress').textContent = 'Descargando... 100%';
+              setTimeout(() => {{
+                document.getElementById('updateProgress').textContent = status.message || '¡Completado! Recargando...';
+              }}, 350);
               setTimeout(() => {{
                 modal.classList.remove('active');
                 if (btn) btn.disabled = false;
                 location.reload();
-              }}, 1500);
+              }}, 1200);
             }}
           }}, 800);
         }} else {{
@@ -525,6 +990,19 @@ def _html_page(title: str, body: str) -> HTMLResponse:
         const pending = Number(data.pending_count || 0);
         const needsCheck = Boolean(data.needs_remote_check);
         const minutesSinceSync = data.minutes_since_last_sync;
+        const nextSignature = `${{pending}}|${{needsCheck ? 1 : 0}}|${{minutesSinceSync ?? 'na'}}`;
+        if (nextSignature !== floatingAlertStateSignature) {{
+          floatingAlertDismissed = false;
+          floatingAlertStateSignature = nextSignature;
+        }}
+
+        if (floatingAlertDismissed) {{
+          box.classList.remove('show');
+          return;
+        }}
+
+        bellState.pendingCount = pending > 0 ? pending : (needsCheck ? 1 : 0);
+        renderNotificationCenter();
         box.classList.add('show');
         box.classList.remove('check');
 
@@ -532,6 +1010,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
           box.classList.add('pending');
           title.textContent = 'Hay novedades';
           text.textContent = `Tienes ${{pending}} notificación(es) pendiente(s) por descargar.`;
+          pushNotification(`Hay ${{pending}} notificación(es) pendiente(s) para actualizar.`, 'pending');
           btn.style.display = 'inline-flex';
         }} else if (needsCheck) {{
           box.classList.remove('pending');
@@ -542,6 +1021,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
           }} else {{
             text.textContent = 'No hay historial local de sincronización. Presiona "Actualizar" para verificar nuevas notificaciones en SNE.';
           }}
+          pushNotification('Conviene revisar nuevas notificaciones. Presiona Actualizar.', 'check');
           btn.style.display = 'inline-flex';
         }} else {{
           box.classList.remove('pending');
@@ -550,6 +1030,8 @@ def _html_page(title: str, body: str) -> HTMLResponse:
           btn.style.display = 'none';
         }}
       }} catch (e) {{
+        bellState.pendingCount = 0;
+        renderNotificationCenter();
         box.classList.add('show');
         box.classList.remove('pending');
         box.classList.remove('check');
@@ -559,6 +1041,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       }}
     }}
 
+    renderNotificationCenter();
     refreshFloatingAlert();
     setInterval(refreshFloatingAlert, 20000);
 
@@ -590,7 +1073,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
 
         const items = data.files.map((f) => (
           `<li><a href="${{f.href}}" target="_blank"><strong>${{f.name}}</strong></a> ` +
-          `<span class="muted">(${{f.date_folder}} | ${{f.size_kb}} KB)</span></li>`
+          `<span class="muted">(${{f.date_folder}} | ${{f.size_kb}} KB | Vence: ${{f.due_date || '-'}} | Tipo: ${{f.document_type || 'No identificado'}})</span></li>`
         )).join('');
         body.innerHTML = `<ul class="docs-list">${{items}}</ul>`;
         body.dataset.loaded = '1';
@@ -620,6 +1103,7 @@ def actualizar():
         return JSONResponse({"success": False, "error": "Ya se está ejecutando una actualización"}, status_code=400)
 
     UPDATE_STATE["progress"] = 5
+    UPDATE_STATE["started_at"] = time.time()
     thread = threading.Thread(target=_run_update, daemon=True)
     thread.start()
     return JSONResponse({"success": True, "message": "Actualización iniciada"})
@@ -628,11 +1112,26 @@ def actualizar():
 @app.get("/api/estado")
 def estado():
     """Devuelve el estado actual de la actualización."""
+    progress = int(UPDATE_STATE.get("progress") or 0)
+    if UPDATE_STATE["running"]:
+        started_at = UPDATE_STATE.get("started_at")
+        if started_at:
+            elapsed = max(0.0, time.time() - float(started_at))
+            estimated = min(95, 10 + int(elapsed / 1.2))
+            progress = max(progress, estimated)
+        progress = min(progress, 99)
+    else:
+        if UPDATE_STATE.get("error"):
+            progress = max(progress, 0)
+        else:
+            progress = 100
+
     return JSONResponse({
         "running": UPDATE_STATE["running"],
-        "progress": UPDATE_STATE["progress"],
+        "progress": progress,
         "error": UPDATE_STATE["error"],
         "message": UPDATE_STATE["message"],
+        "recent_downloads": UPDATE_STATE.get("recent_downloads", []),
     })
 
 
@@ -654,14 +1153,16 @@ def index(
   q: str = Query(default="", description="Texto para buscar"),
   page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
+    head_actions = _head_actions_html()
+
     if not DB_PATH.exists():
         return _html_page(
             "OsiDOc Viewer",
-            """
+            f"""
 <div class="card">
   <div class="head">
     <div><h1>OsiDOc Viewer</h1><div class="meta">Base de datos no encontrada</div></div>
-    <button class="btn refresh" onclick="abrirActualizacion()"><span class="spinner"></span>Actualizar</button>
+    {head_actions}
   </div>
   <div class="content">
     <div class="info-box">No existe la base de datos SQLite. Primero ejecuta <code>osinergmin_auth.py</code> para generar la data.</div>
@@ -675,9 +1176,9 @@ def index(
         if not columns:
             return _html_page(
                 "OsiDOc Viewer",
-                """
+                f"""
 <div class="card">
-  <div class="head"><h1>OsiDOc Viewer</h1><span class="badge">Sin tabla</span></div>
+  <div class="head"><div><h1>OsiDOc Viewer</h1><span class="badge">Sin tabla</span></div>{head_actions}</div>
   <div class="content">No se encontró la tabla notificaciones.</div>
 </div>
 """,
@@ -701,6 +1202,7 @@ def index(
     notif_col = _find_notification_column(columns)
     due_col = _find_due_date_column(columns)
     asunto_col = next((c for c in columns if c.lower() == "asunto"), None)
+    notif_date_col = next((c for c in columns if c.lower() in ["fecha_de_notificacion", "fecha_notificacion"]), None)
 
     pending_notifs = _get_pending_notifications()
     pending_count = len(pending_notifs)
@@ -716,20 +1218,29 @@ def index(
             val = str(row[c] if row[c] is not None else "")
             tds.append(f"<td>{html.escape(val[:50])}</td>" if len(val) > 50 else f"<td>{html.escape(val)}</td>")
 
-        due_value = ""
-        if due_col and row[due_col] is not None:
-          due_value = str(row[due_col]).strip()
-        tds.append(f"<td>{html.escape(due_value) if due_value else '-'}</td>")
-
         source_text = ""
         if asunto_col and row[asunto_col] is not None:
           source_text = str(row[asunto_col])
         elif notif_col and row[notif_col] is not None:
           source_text = str(row[notif_col])
-        doc_type = _infer_document_type(source_text)
-        tds.append(f"<td>{html.escape(doc_type)}</td>")
 
         notif = str(row[notif_col]) if notif_col and row[notif_col] else ""
+        due_value = ""
+        doc_type = _infer_document_type(source_text)
+        notif_date_text = str(row[notif_date_col]) if notif_date_col and row[notif_date_col] is not None else ""
+        if notif:
+          due_from_docs, doc_type_from_docs = _summarize_notification_metadata(notif, source_text, notif_date_text)
+          if due_from_docs:
+            due_value = due_from_docs
+          if doc_type_from_docs:
+            doc_type = doc_type_from_docs
+
+        if not due_value and due_col and row[due_col] is not None:
+          due_value = str(row[due_col]).strip()
+        due_display = due_value if due_value else ("Sin fecha explicita" if notif else "-")
+        tds.append(f"<td>{html.escape(due_display)}</td>")
+        tds.append(f"<td>{html.escape(doc_type)}</td>")
+
         row_id = int(row["rowid"])
         if notif:
             docs_link = (
@@ -760,7 +1271,7 @@ def index(
       <h1>OsiDOc Viewer</h1>
       <div class="meta">📊 {total} registros en BD</div>
     </div>
-    <button class="btn refresh" onclick="abrirActualizacion()"><span class="spinner"></span>Actualizar</button>
+    {head_actions}
   </div>
   <div class="content">
     <form class="toolbar" method="get" action="/">
@@ -801,7 +1312,7 @@ def index(
 
 @app.get("/notificaciones/{numero}/documentos", response_class=HTMLResponse)
 def documentos(numero: str) -> HTMLResponse:
-    docs = sorted(DOWNLOADS_DIR.glob(f"*/{numero}/*"), key=lambda p: p.name.lower())
+    docs = _build_notification_files_metadata(numero)
 
     if not docs:
         body = f"""
@@ -816,13 +1327,14 @@ def documentos(numero: str) -> HTMLResponse:
         return _html_page(f"Documentos {numero}", body)
 
     items: list[str] = []
-    for path in docs:
-        relative = path.relative_to(DOWNLOADS_DIR).as_posix()
-        href = f"/files/{quote(relative)}"
-        date_folder = path.parents[1].name if len(path.parents) > 1 else ""
+    for doc in docs:
+        due_display = doc['due_date'] or (
+          f"{doc['deadline_days']} dias (estimado por plazo)" if doc.get('deadline_days') else "Sin fecha explicita"
+        )
         items.append(
-            f"<li><a href='{href}' target='_blank'><strong>{html.escape(path.name)}</strong></a> "
-            f"<span class='muted'>({html.escape(date_folder)})</span></li>"
+            f"<li><a href='{html.escape(doc['href'])}' target='_blank'><strong>{html.escape(doc['name'])}</strong></a> "
+            f"<span class='muted'>({html.escape(doc['date_folder'])} | {html.escape(doc['size_kb'])} KB | "
+            f"Vence: {html.escape(due_display)} | Tipo: {html.escape(doc['document_type'])})</span></li>"
         )
 
     body = f"""
@@ -839,24 +1351,7 @@ def documentos(numero: str) -> HTMLResponse:
 
 @app.get("/api/notificaciones/{numero}/documentos")
 def documentos_api(numero: str):
-    docs = sorted(DOWNLOADS_DIR.glob(f"*/{numero}/*"), key=lambda p: p.name.lower())
-    files: list[dict[str, str]] = []
-    for path in docs:
-        relative = path.relative_to(DOWNLOADS_DIR).as_posix()
-        href = f"/files/{quote(relative)}"
-        date_folder = path.parents[1].name if len(path.parents) > 1 else ""
-        try:
-            size_kb = f"{path.stat().st_size / 1024:.2f}"
-        except OSError:
-            size_kb = "0.00"
-        files.append(
-            {
-                "name": path.name,
-                "href": href,
-                "date_folder": date_folder,
-                "size_kb": size_kb,
-            }
-        )
+    files = _build_notification_files_metadata(numero)
 
     return JSONResponse({"numero": numero, "files": files})
 
