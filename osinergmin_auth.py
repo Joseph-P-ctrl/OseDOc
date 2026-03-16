@@ -75,6 +75,7 @@ class AuthConfig:
     )
     download_dir: str = "downloads"
     export_wait_seconds: int = 40
+    target_notifications: tuple[str, ...] = ()
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -87,6 +88,25 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "si", "on"}
+
+
+def _parse_target_notifications(raw: str) -> tuple[str, ...]:
+    """Parsea lista CSV/espaciada de Nro. Notificacion y devuelve valores unicos."""
+    if not raw:
+        return ()
+
+    parts = [p.strip() for p in re.split(r"[\s,;]+", raw) if p.strip()]
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        val = re.sub(r"[^0-9\-]", "", part).strip("-")
+        if not re.fullmatch(r"\d{8,}-\d+", val):
+            continue
+        if val in seen:
+            continue
+        seen.add(val)
+        out.append(val)
+    return tuple(out)
 
 
 def _load_dotenv(dotenv_path: str = ".env") -> None:
@@ -818,6 +838,134 @@ return false;
         return False
 
 
+def _go_to_next_grid_page(driver, cfg: AuthConfig) -> bool:
+    """Avanza a la siguiente pagina del jqGrid si el pager Next esta habilitado."""
+    try:
+        _, pager_before, _, _ = _get_visible_grid_status(driver)
+        clicked = bool(
+            driver.execute_script(
+                """
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+
+const nextCandidates = Array.from(document.querySelectorAll(
+    "span.ui-icon.ui-icon-seek-next, .ui-pg-button .ui-icon-seek-next, .ui-icon-seek-next, td[id^='next_']"
+));
+
+for (const node of nextCandidates) {
+    const icon = node.matches("span.ui-icon.ui-icon-seek-next") ? node : node.querySelector?.("span.ui-icon.ui-icon-seek-next");
+    const target = icon || (node.matches("td") ? node : (node.closest("td") || node));
+    const clickable = target.matches("td") ? target : (target.closest("td") || target);
+    if (!clickable || !isVisible(clickable)) continue;
+    const cls = (target.className || '').toLowerCase();
+    const tdCls = (clickable.className || '').toLowerCase();
+    if (cls.includes('disabled') || cls.includes('ui-state-disabled') || tdCls.includes('disabled') || tdCls.includes('ui-state-disabled')) continue;
+    try { clickable.scrollIntoView({ block: 'center' }); } catch (e) {}
+    try { target.click(); return true; } catch (e) {}
+    try { clickable.click(); return true; } catch (e) {}
+    try {
+        ['pointerdown','mousedown','pointerup','mouseup','click'].forEach((t) => {
+            target.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+        });
+        return true;
+    } catch (e) {}
+}
+
+return false;
+"""
+            )
+        )
+        if not clicked:
+            return False
+
+        # Espera a que el grid refleje cambio de pagina.
+        end_time = time.time() + max(2.0, cfg.timeout / 2)
+        while time.time() < end_time:
+            _, pager_now, _, _ = _get_visible_grid_status(driver)
+            if (pager_now or "") != (pager_before or ""):
+                time.sleep(0.2)
+                return True
+            time.sleep(0.15)
+        return False
+    except Exception:
+        return False
+
+
+def _go_to_first_grid_page(driver, cfg: AuthConfig) -> bool:
+    """Regresa a la primera pagina del jqGrid si el pager First esta habilitado."""
+    try:
+        moved = bool(
+            driver.execute_script(
+                """
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+
+const firstCandidates = Array.from(document.querySelectorAll(
+    "td[id^='first_'], .ui-pg-button .ui-icon-seek-first, .ui-icon-seek-first"
+));
+
+for (const node of firstCandidates) {
+    const target = node.matches("td") ? node : (node.closest("td") || node);
+    if (!target || !isVisible(target)) continue;
+    const cls = (target.className || '').toLowerCase();
+    if (cls.includes('disabled') || cls.includes('ui-state-disabled')) {
+        return false;
+    }
+    try { target.scrollIntoView({ block: 'center' }); } catch (e) {}
+    try { target.click(); return true; } catch (e) {}
+    try {
+        ['pointerdown','mousedown','pointerup','mouseup','click'].forEach((t) => {
+            target.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+        });
+        return true;
+    } catch (e) {}
+}
+
+return false;
+"""
+            )
+        )
+
+        if moved:
+            end_time = time.time() + max(2.0, cfg.timeout / 2)
+            while time.time() < end_time:
+                _get_visible_grid_status(driver)
+                time.sleep(0.2)
+                return True
+        return True
+    except Exception:
+        return False
+
+
+def _click_lupa_by_notification_number_any_page(driver, cfg: AuthConfig, notification_number: str) -> bool:
+    """Busca la notificacion en la pagina actual y siguientes paginas del grid."""
+    if not notification_number:
+        return False
+
+    # Siempre vuelve al inicio para no perder notificaciones que quedaron en paginas anteriores.
+    _go_to_first_grid_page(driver, cfg)
+
+    # Intenta primero en la primera pagina.
+    if _click_lupa_by_notification_number(driver, notification_number):
+        return True
+
+    # Si no esta visible, avanza por paginas y vuelve a intentar.
+    max_page_hops = 120
+    for _ in range(max_page_hops):
+        if not _go_to_next_grid_page(driver, cfg):
+            break
+        if _click_lupa_by_notification_number(driver, notification_number):
+            return True
+
+    return False
+
+
 def _click_documentos_notificados(driver, cfg: AuthConfig) -> bool:
     """Abre la seccion Documentos notificados dentro del detalle de notificacion."""
     link = _find_first(
@@ -1343,34 +1491,57 @@ def _download_documents_from_visible_results(
     for idx, notification_number in enumerate(notification_numbers, start=1):
         logging.info("Procesando notificacion %s de %s: %s", idx, len(notification_numbers), notification_number)
 
-        # Re-estabiliza la grilla antes de cada notificacion para evitar filas no clickeables.
-        buscar_btn = _find_first(driver, [(By.ID, cfg.sne_buscar_button_id)], 3)
-        if buscar_btn is not None:
-            _click_search_button_and_wait(driver, buscar_btn, cfg)
-            time.sleep(0.5)
+        downloaded_here = 0
+        max_open_attempts = 5
+        opened_docs = False
+        for attempt in range(1, max_open_attempts + 1):
+            if not _click_lupa_by_notification_number_any_page(driver, cfg, notification_number):
+                if attempt == max_open_attempts:
+                    logging.warning("No se pudo abrir la lupita de la notificacion %s.", notification_number)
+                    break
+                logging.info(
+                    "Reintento %s/%s para abrir lupita de notificacion %s.",
+                    attempt + 1,
+                    max_open_attempts,
+                    notification_number,
+                )
+                _close_visible_dialogs(driver)
+                time.sleep(0.4)
+                continue
 
-        if not _click_lupa_by_notification_number(driver, notification_number):
-            logging.warning("No se pudo abrir la lupita de la notificacion %s.", notification_number)
-            continue
+            if not _click_documentos_notificados(driver, cfg):
+                if attempt == max_open_attempts:
+                    logging.warning("No se pudo abrir 'Documentos notificados' en la notificacion %s.", notification_number)
+                    _click_regresar_sequence(driver, cfg)
+                    _close_visible_dialogs(driver)
+                    break
+                logging.info(
+                    "Reintento %s/%s para abrir 'Documentos notificados' en %s.",
+                    attempt + 1,
+                    max_open_attempts,
+                    notification_number,
+                )
+                _click_regresar_sequence(driver, cfg)
+                _close_visible_dialogs(driver)
+                time.sleep(0.4)
+                continue
 
-        if not _click_documentos_notificados(driver, cfg):
-            logging.warning("No se pudo abrir 'Documentos notificados' en la notificacion %s.", notification_number)
-            _click_regresar_sequence(driver, cfg)
-            _close_visible_dialogs(driver)
-            continue
+            time.sleep(0.4)
+            downloaded_here = _download_visible_document_links_for_notification(
+                driver,
+                cfg,
+                download_dir,
+                notification_number,
+            )
+            opened_docs = True
+            break
 
-        time.sleep(0.4)
-        downloaded_here = _download_visible_document_links_for_notification(
-            driver,
-            cfg,
-            download_dir,
-            notification_number,
-        )
         total_downloads += downloaded_here
         logging.info("Documentos descargados en notificacion %s: %s", notification_number, downloaded_here)
-        _click_regresar_sequence(driver, cfg)
-        _close_visible_dialogs(driver)
-        time.sleep(0.4)
+        if opened_docs:
+            _click_regresar_sequence(driver, cfg)
+            _close_visible_dialogs(driver)
+            time.sleep(0.4)
 
     return total_downloads
 
@@ -1652,6 +1823,17 @@ sel.value = val;
     if not excel_notification_numbers:
         logging.warning("No se leyeron numeros de notificacion desde el Excel; se usara el grid visible.")
         excel_notification_numbers = None
+
+    if cfg.target_notifications:
+        if excel_notification_numbers is None:
+            excel_notification_numbers = list(cfg.target_notifications)
+        else:
+            wanted = set(cfg.target_notifications)
+            excel_notification_numbers = [n for n in excel_notification_numbers if n in wanted]
+        logging.info(
+            "Modo focalizado activo: %s notificaciones objetivo.",
+            len(excel_notification_numbers or []),
+        )
 
     docs_downloaded = _download_documents_from_visible_results(driver, cfg, download_dir, excel_notification_numbers)
     if docs_downloaded > 0:
@@ -2356,6 +2538,11 @@ def main() -> None:
         help="Segundos maximos para esperar el archivo Excel descargado (env: OSI_EXPORT_WAIT_SECONDS)",
     )
     parser.add_argument(
+        "--target-notifications",
+        default=os.getenv("OSI_TARGET_NOTIFICATIONS", ""),
+        help="Lista de Nro. Notificacion separados por coma/espacio para procesar solo esos (env: OSI_TARGET_NOTIFICATIONS)",
+    )
+    parser.add_argument(
         "--user-agent",
         default=os.getenv(
             "OSI_USER_AGENT",
@@ -2404,6 +2591,7 @@ def main() -> None:
         sne_export_excel_selector=args.sne_export_excel_selector,
         download_dir=args.download_dir,
         export_wait_seconds=args.export_wait_seconds,
+        target_notifications=_parse_target_notifications(args.target_notifications),
         user_agent=args.user_agent,
     )
 

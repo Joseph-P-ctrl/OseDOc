@@ -24,7 +24,7 @@ DB_PATH = Path(_DB_ENV)
 if not DB_PATH.is_absolute():
     DB_PATH = (WORKSPACE_DIR / DB_PATH).resolve()
 
-PAGE_SIZE_DEFAULT = int(os.getenv("OSI_WEB_PAGE_SIZE", "50"))
+PAGE_SIZE_DEFAULT = int(os.getenv("OSI_WEB_PAGE_SIZE", "10"))
 COLUMNS_TO_DISPLAY = [
     "nro__notificacion",
     "nro__expediente",
