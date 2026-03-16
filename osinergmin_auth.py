@@ -1132,6 +1132,38 @@ def _get_notifications_with_downloads(base_download_dir: Path) -> set[str]:
     return existing
 
 
+def _normalize_exported_excel_file(download_dir: Path, downloaded_file: Path) -> Path:
+    """Deja un solo Excel de exportacion con nombre fijo y elimina copias (1), (2), ..."""
+    canonical = download_dir / "Notificaciones Electrónicas.xlsx"
+
+    try:
+        if downloaded_file.resolve() != canonical.resolve():
+            if canonical.exists():
+                try:
+                    canonical.unlink()
+                except Exception:
+                    pass
+            try:
+                downloaded_file.replace(canonical)
+                downloaded_file = canonical
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    dup_pattern = re.compile(r"^Notificaciones Electr[oó]nicas \(\d+\)\.xlsx$", re.IGNORECASE)
+    for candidate in download_dir.glob("*.xlsx"):
+        name = candidate.name
+        if not dup_pattern.fullmatch(name):
+            continue
+        try:
+            candidate.unlink()
+        except Exception:
+            pass
+
+    return downloaded_file
+
+
 def _save_excel_to_sqlite(excel_path: Path, db_path: Path) -> int:
     """Lee el Excel exportado y guarda/actualiza todas las filas en SQLite.
     Retorna la cantidad de filas insertadas o actualizadas."""
@@ -1832,6 +1864,8 @@ sel.value = val;
     if downloaded_file is None:
         logging.warning("No se detecto descarga de Excel dentro del tiempo esperado (%ss).", cfg.export_wait_seconds)
         return False
+
+    downloaded_file = _normalize_exported_excel_file(download_dir, downloaded_file)
 
     logging.info("Exportacion a Excel completada. Archivo descargado: %s", downloaded_file.name)
 

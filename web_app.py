@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import os
+import re
 import sqlite3
 import subprocess
 import threading
@@ -94,6 +95,24 @@ def _find_notification_column(columns: list[str]) -> str | None:
         if "notif" in col.lower():
             return col
     return None
+
+
+def _notifications_with_files(base_dir: Path) -> set[str]:
+  out: set[str] = set()
+  pat = re.compile(r"\d{8,}-\d+")
+  if not base_dir.exists():
+    return out
+
+  for folder in base_dir.rglob("*"):
+    if not folder.is_dir() or not pat.fullmatch(folder.name):
+      continue
+    try:
+      has_file = any(p.is_file() for p in folder.iterdir())
+    except Exception:
+      has_file = False
+    if has_file:
+      out.add(folder.name)
+  return out
 
 
 def _html_page(title: str, body: str) -> HTMLResponse:
@@ -453,6 +472,22 @@ def index(
 
     notif_col = _find_notification_column(columns)
 
+    db_notifs: set[str] = set()
+    if notif_col:
+        for row in rows:
+            raw = str(row[notif_col] or "").strip()
+            if raw:
+                db_notifs.add(raw)
+
+        # Usa conteo real de toda la tabla para alerta global, no solo pagina actual.
+        with _connect() as con2:
+            q_pending = f'SELECT DISTINCT "{notif_col}" FROM notificaciones WHERE "{notif_col}" IS NOT NULL AND TRIM("{notif_col}") <> ""'
+            db_notifs = {str(r[0]).strip() for r in con2.execute(q_pending).fetchall() if str(r[0] or "").strip()}
+
+    downloaded_notifs = _notifications_with_files(DOWNLOADS_DIR)
+    pending_notifs = sorted(n for n in db_notifs if n not in downloaded_notifs)
+    pending_count = len(pending_notifs)
+
     display_cols = [c for c in columns if c.lower() in [dc.lower() for dc in COLUMNS_TO_DISPLAY]]
     head = "".join(f"<th>{html.escape(c)}</th>" for c in display_cols) + "<th>Documentos</th>"
     body_rows: list[str] = []
@@ -501,6 +536,9 @@ def index(
     </form>
     <div class="info-box">
       📄 Página {page} de {(total + page_size - 1) // page_size} | Total: {total} registros
+    </div>
+    <div class="info-box" style="border-left-color: {'#e67e22' if pending_count > 0 else '#27ae60'}; background: {'#fff6e8' if pending_count > 0 else '#edf9f1'}; color: {'#9a5b00' if pending_count > 0 else '#1d7d46'};">
+      {'⚠️ Hay ' + str(pending_count) + ' notificación(es) pendiente(s) por descargar. Presiona "Actualizar".' if pending_count > 0 else '✅ No hay pendientes por descargar en este momento.'}
     </div>
     <div class="toolbar">
       <a class="btn secondary" href="/?q={quote(q)}&page={prev_page}&page_size={page_size}">← Anterior</a>
