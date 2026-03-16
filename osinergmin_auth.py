@@ -719,6 +719,248 @@ return true;
     return headers, all_rows
 
 
+def _get_visible_lupa_count(driver) -> int:
+    """Cuenta lupitas visibles de Lectura de Notificacion en el grid actual."""
+    try:
+        return int(
+            driver.execute_script(
+                """
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const rows = Array.from(document.querySelectorAll('table.ui-jqgrid-btable tr.jqgrow')).filter((tr) => isVisible(tr));
+let count = 0;
+for (const row of rows) {
+    const icon = row.querySelector("img[title*='Lectura'], img[src*='icon_search.png']");
+    if (icon && isVisible(icon)) count += 1;
+}
+return count;
+"""
+            )
+        )
+    except Exception:
+        return 0
+
+
+def _click_lupa_by_index(driver, index: int) -> bool:
+    """Hace clic en la lupita de una fila visible por indice (0-based)."""
+    try:
+        return bool(
+            driver.execute_script(
+                """
+const idx = arguments[0];
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const rows = Array.from(document.querySelectorAll('table.ui-jqgrid-btable tr.jqgrow')).filter((tr) => isVisible(tr));
+if (idx < 0 || idx >= rows.length) return false;
+const icon = rows[idx].querySelector("img[title*='Lectura'], img[src*='icon_search.png']");
+if (!icon || !isVisible(icon)) return false;
+try { icon.scrollIntoView({ block: 'center' }); } catch (e) {}
+['pointerdown','mousedown','pointerup','mouseup','click'].forEach((t) => {
+    icon.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+});
+try { icon.click(); } catch (e) {}
+return true;
+""",
+                index,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _click_documentos_notificados(driver, cfg: AuthConfig) -> bool:
+    """Abre la seccion Documentos notificados dentro del detalle de notificacion."""
+    link = _find_first(
+        driver,
+        [
+            (By.ID, "verDocumentosNotificacion-link"),
+            (By.XPATH, "//a[@id='verDocumentosNotificacion-link' and contains(normalize-space(.), 'Documentos notificados') ]"),
+            (By.XPATH, "//a[contains(normalize-space(.), 'Documentos notificados')]"),
+        ],
+        cfg.timeout,
+    )
+    if link is None:
+        return False
+
+    try:
+        if _click_ingresar_button(driver, link):
+            return True
+    except Exception:
+        pass
+
+    try:
+        driver.execute_script("arguments[0].click();", link)
+        return True
+    except Exception:
+        return False
+
+
+def _download_visible_document_links(driver, cfg: AuthConfig, download_dir: Path) -> int:
+    """Descarga todos los links visibles 'Descargar archivo' del detalle abierto."""
+    downloaded = 0
+
+    def _count_links() -> int:
+        try:
+            return int(
+                driver.execute_script(
+                    """
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const links = Array.from(document.querySelectorAll("a[title='Descargar archivo'], a[href*='descargarArchivoNotificacion']"))
+    .filter((a) => isVisible(a));
+return links.length;
+"""
+                )
+            )
+        except Exception:
+            return 0
+
+    link_count = _count_links()
+    for idx in range(link_count):
+        before = _snapshot_downloads(download_dir)
+        try:
+            clicked = bool(
+                driver.execute_script(
+                    """
+const index = arguments[0];
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const links = Array.from(document.querySelectorAll("a[title='Descargar archivo'], a[href*='descargarArchivoNotificacion']"))
+    .filter((a) => isVisible(a));
+if (index < 0 || index >= links.length) return false;
+const link = links[index];
+try { link.scrollIntoView({ block: 'center' }); } catch (e) {}
+['pointerdown','mousedown','pointerup','mouseup','click'].forEach((t) => {
+    link.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+});
+try { link.click(); } catch (e) {}
+return true;
+""",
+                    idx,
+                )
+            )
+        except Exception:
+            clicked = False
+
+        if not clicked:
+            continue
+
+        _accept_browser_alert_if_present(driver)
+        file_path = _wait_for_new_download(download_dir, before, max(10, cfg.export_wait_seconds))
+        if file_path is not None:
+            downloaded += 1
+
+    return downloaded
+
+
+def _close_visible_dialogs(driver) -> None:
+    """Intenta cerrar dialogs/modales visibles para volver al listado."""
+    try:
+        driver.execute_script(
+            """
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const closeCandidates = Array.from(document.querySelectorAll(
+  "a.ui-dialog-titlebar-close, button.ui-dialog-titlebar-close, .ui-icon-closethick, button, a"
+)).filter((el) => isVisible(el));
+
+for (const el of closeCandidates) {
+  const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+  if (el.classList.contains('ui-dialog-titlebar-close') || text === 'cerrar' || text === 'volver' || text === 'regresar') {
+    try { el.click(); } catch (e) {}
+  }
+}
+"""
+        )
+    except Exception:
+        pass
+
+
+def _click_regresar_sequence(driver, cfg: AuthConfig) -> None:
+    """Hace clic en Regresar de documentos y luego en Regresar de detalle."""
+
+    def _click_if_present(selectors: list[tuple[str, str]]) -> bool:
+        target = _find_first(driver, selectors, 3)
+        if target is None:
+            return False
+
+        try:
+            if _click_ingresar_button(driver, target):
+                return True
+        except Exception:
+            pass
+
+        try:
+            driver.execute_script("arguments[0].click();", target)
+            return True
+        except Exception:
+            return False
+
+    # 1) Regresar de Documentos notificados
+    _click_if_present(
+        [
+            (By.ID, "regresar-documentosNotificacion-boton"),
+            (By.XPATH, "//input[@type='button' and @id='regresar-documentosNotificacion-boton' and @value='Regresar']"),
+        ]
+    )
+    time.sleep(0.35)
+
+    # 2) Regresar del detalle de notificacion
+    _click_if_present(
+        [
+            (By.ID, "regresar-boton"),
+            (By.XPATH, "//input[@type='button' and @id='regresar-boton' and @value='Regresar']"),
+        ]
+    )
+    time.sleep(0.35)
+
+
+def _download_documents_from_visible_results(driver, cfg: AuthConfig, download_dir: Path) -> int:
+    """Por cada resultado visible, abre detalle y descarga sus documentos notificados."""
+    total_downloads = 0
+    results_count = _get_visible_lupa_count(driver)
+    logging.info("Cantidad de lupas visibles: %s", results_count)
+    if results_count <= 0:
+        return 0
+
+    for idx in range(results_count):
+        logging.info("Procesando notificacion %s de %s.", idx + 1, results_count)
+        if not _click_lupa_by_index(driver, idx):
+            logging.warning("No se pudo abrir la lupita de la notificacion %s.", idx + 1)
+            continue
+
+        if not _click_documentos_notificados(driver, cfg):
+            logging.warning("No se pudo abrir 'Documentos notificados' en la notificacion %s.", idx + 1)
+            _click_regresar_sequence(driver, cfg)
+            _close_visible_dialogs(driver)
+            continue
+
+        time.sleep(0.4)
+        downloaded_here = _download_visible_document_links(driver, cfg, download_dir)
+        total_downloads += downloaded_here
+        logging.info("Documentos descargados en notificacion %s: %s", idx + 1, downloaded_here)
+        _click_regresar_sequence(driver, cfg)
+        _close_visible_dialogs(driver)
+        time.sleep(0.4)
+
+    return total_downloads
+
+
 def _get_visible_grid_status(driver) -> tuple[int, str, bool, bool]:
     """Lee estado visible del listado: filas, pager, bandera sin resultados y bandera pager con datos."""
     try:
@@ -861,7 +1103,8 @@ if (window.jQuery) {
         # Selecciona estado de lectura en el filtro del SNE.
         try:
             select_leido = driver.find_element(By.ID, "leidoNotificacion")
-            leido_value = (cfg.sne_leido_value or "").strip()
+            # Fuerza siempre "Todos" para mantener el comportamiento solicitado.
+            leido_value = ""
             driver.execute_script(
                 """
 const sel = arguments[0];
@@ -984,6 +1227,13 @@ sel.value = val;
         return False
 
     logging.info("Exportacion a Excel completada. Archivo descargado: %s", downloaded_file.name)
+
+    docs_downloaded = _download_documents_from_visible_results(driver, cfg, download_dir)
+    if docs_downloaded > 0:
+        logging.info("Descarga de documentos notificados completada. Archivos descargados: %s", docs_downloaded)
+    else:
+        logging.warning("No se descargaron documentos notificados desde las filas visibles.")
+
     return True
 
 
