@@ -519,7 +519,7 @@ def _head_actions_html() -> str:
           </ul>
         </div>
       </div>
-      <button class="btn stats-btn" onclick="abrirEstadisticas()" title="Ver estadísticas">&#128202; Estadísticas</button>
+      <button class="btn stats-btn" onclick="abrirEstadisticas()" title="Ver estadísticas por tipo de documento">&#128202; Estadísticas</button>
       <button class="btn refresh" onclick="abrirActualizacion(event)"><span class="spinner"></span>Actualizar</button>
     </div>
     """
@@ -622,68 +622,12 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     }}
     .btn.secondary {{ background: #425f7f; }}
     .btn.secondary:hover {{ background: #2f4a67; }}
-    .btn.stats-btn {{
-      background: linear-gradient(110deg, #6d28d9, #8b5cf6);
-      padding: 10px 15px;
-      font-weight: 600;
-    }}
-    .btn.stats-btn:hover {{ background: linear-gradient(110deg, #5b21b6, #7c3aed); }}
     .btn.refresh {{
       background: linear-gradient(110deg, #1f9d55, #3abf72);
       padding: 10px 18px;
       font-weight: 600;
     }}
     .btn.refresh:hover {{ background: linear-gradient(110deg, #188a4a, #2eab63); }}
-    #statsModal {{
-      position: fixed; inset: 0;
-      background: rgba(0,0,0,0.55);
-      display: none; align-items: center; justify-content: center;
-      z-index: 9999;
-    }}
-    #statsModal.active {{ display: flex; }}
-    .stats-box {{
-      background: #fff;
-      border-radius: 18px;
-      box-shadow: 0 24px 64px rgba(0,0,0,0.22);
-      padding: 32px 36px;
-      min-width: 360px;
-      max-width: 620px;
-      width: 100%;
-      max-height: 90vh;
-      overflow-y: auto;
-    }}
-    .stats-header {{
-      display: flex; justify-content: space-between; align-items: center;
-      margin-bottom: 20px;
-    }}
-    .stats-header h2 {{ margin: 0; font-size: 20px; color: #132236; }}
-    .stats-close {{
-      background: none; border: none; font-size: 24px; cursor: pointer;
-      color: #607188; line-height: 1; padding: 0 4px;
-    }}
-    .stats-close:hover {{ color: #132236; }}
-    .stats-total {{
-      font-size: 13px; color: #607188; margin-bottom: 18px;
-    }}
-    .stats-bar-row {{
-      margin-bottom: 12px;
-    }}
-    .stats-label {{
-      display: flex; justify-content: space-between;
-      font-size: 14px; font-weight: 500; margin-bottom: 4px;
-      color: #132236;
-    }}
-    .stats-label .stats-count {{
-      font-weight: 700; color: #0057b8;
-    }}
-    .stats-track {{
-      background: #e8f0fb; border-radius: 999px; height: 14px; overflow: hidden;
-    }}
-    .stats-fill {{
-      height: 100%; border-radius: 999px;
-      background: linear-gradient(90deg, #0057b8, #0284c7);
-      transition: width 0.5s ease;
-    }}
     .notif-wrap {{ position: relative; }}
     .bell-btn {{
       position: relative;
@@ -902,6 +846,42 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     .fa-text {{ font-size: 13px; line-height: 1.4; }}
     .fa-actions {{ margin-top: 10px; text-align: right; }}
     .fa-actions .btn {{ padding: 8px 10px; font-size: 13px; }}
+    .btn.stats-btn {{
+      background: linear-gradient(110deg, #6a4fc8, #8b6ce0);
+      padding: 10px 16px;
+      font-weight: 600;
+    }}
+    .btn.stats-btn:hover {{ background: linear-gradient(110deg, #5a3fb8, #7a5bd0); }}
+    .stats-modal-content {{
+      background: var(--card);
+      border-radius: 16px;
+      padding: 36px 40px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+      max-width: 560px;
+      width: 95%;
+      animation: slideUp 0.3s ease;
+    }}
+    .stats-modal-content h2 {{ margin: 0 0 20px; color: var(--ink); font-size: 20px; }}
+    .stats-close {{
+      float: right;
+      background: transparent;
+      border: 0;
+      font-size: 22px;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 0 4px;
+      line-height: 1;
+    }}
+    .stats-close:hover {{ color: var(--ink); background: transparent; transform: none; box-shadow: none; }}
+    .stats-loading {{ text-align: center; color: var(--muted); padding: 30px 0; }}
+    .stats-table {{ width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 4px; }}
+    .stats-table th, .stats-table td {{ border-bottom: 1px solid var(--line); padding: 10px 12px; text-align: left; }}
+    .stats-table th {{ background: var(--accent); color: #0b3f76; font-weight: 700; position: sticky; top: 0; }}
+    .stats-table tr:last-child td {{ border-bottom: 0; }}
+    .stats-table .count-cell {{ text-align: right; font-weight: 700; color: var(--brand); }}
+    .stats-bar-wrap {{ background: #e8f0fb; border-radius: 999px; height: 8px; min-width: 80px; overflow: hidden; display: inline-block; vertical-align: middle; width: 120px; margin-left: 8px; }}
+    .stats-bar {{ height: 100%; background: linear-gradient(90deg, #0057b8, #0284c7); border-radius: 999px; transition: width 0.4s ease; }}
+    .stats-total {{ margin-top: 16px; font-size: 13px; color: var(--muted); text-align: right; }}
   </style>
 </head>
 <body>
@@ -913,14 +893,12 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       <p class=\"modal-text\" id=\"updateProgress\">Conectando con el servidor...</p>
     </div>
   </div>
-  <div id=\"statsModal\">
-    <div class=\"stats-box\">
-      <div class=\"stats-header\">
-        <h2>&#128202; Estadísticas de documentos</h2>
-        <button class=\"stats-close\" onclick=\"cerrarEstadisticas()\">&times;</button>
-      </div>
-      <div class=\"stats-total\" id=\"statsTotal\">Cargando...</div>
-      <div id=\"statsContent\"></div>
+  <div id="statsModal" class="modal" onclick="_cerrarStatsIfBackdrop(event)">
+    <div class="stats-modal-content">
+      <button type="button" class="stats-close" onclick="cerrarEstadisticas()" title="Cerrar">&times;</button>
+      <h2>&#128202; Estad&#237;sticas por tipo de documento</h2>
+      <div id="statsBody"><div class="stats-loading">Cargando estad&#237;sticas...</div></div>
+      <div id="statsTotal" class="stats-total"></div>
     </div>
   </div>
   <div id="floatingAlert" class="floating-alert" aria-live="polite">
@@ -932,52 +910,6 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     </div>
   </div>
   <script>
-    const STATS_COLORS = [
-      'linear-gradient(90deg,#0057b8,#0284c7)',
-      'linear-gradient(90deg,#6d28d9,#8b5cf6)',
-      'linear-gradient(90deg,#1f9d55,#3abf72)',
-      'linear-gradient(90deg,#d97706,#fbbf24)',
-      'linear-gradient(90deg,#dc2626,#f87171)',
-      'linear-gradient(90deg,#0891b2,#22d3ee)',
-      'linear-gradient(90deg,#7c3aed,#a78bfa)',
-      'linear-gradient(90deg,#059669,#34d399)',
-    ];
-    async function abrirEstadisticas() {{
-      document.getElementById('statsModal').classList.add('active');
-      document.getElementById('statsTotal').textContent = 'Cargando...';
-      document.getElementById('statsContent').innerHTML = '';
-      try {{
-        const res = await fetch('/api/estadisticas');
-        const data = await res.json();
-        const tipos = data.tipos || [];
-        const total = data.total || 0;
-        document.getElementById('statsTotal').textContent =
-          `${{total}} documento${{total !== 1 ? 's' : ''}} en ${{tipos.length}} tipo${{tipos.length !== 1 ? 's' : ''}}`;
-        const max = tipos.length > 0 ? tipos[0].cantidad : 1;
-        document.getElementById('statsContent').innerHTML = tipos.map((t, i) => {{
-          const pct = Math.round((t.cantidad / max) * 100);
-          const color = STATS_COLORS[i % STATS_COLORS.length];
-          return `<div class="stats-bar-row">
-            <div class="stats-label">
-              <span>${{t.tipo}}</span>
-              <span class="stats-count">${{t.cantidad}}</span>
-            </div>
-            <div class="stats-track">
-              <div class="stats-fill" style="width:${{pct}}%;background:${{color}}"></div>
-            </div>
-          </div>`;
-        }}).join('');
-      }} catch(e) {{
-        document.getElementById('statsTotal').textContent = 'Error al cargar estadísticas.';
-      }}
-    }}
-    function cerrarEstadisticas() {{
-      document.getElementById('statsModal').classList.remove('active');
-    }}
-    document.getElementById('statsModal').addEventListener('click', function(e) {{
-      if (e.target === this) cerrarEstadisticas();
-    }});
-
     const bellState = {{ items: [], keys: new Set(), pendingCount: 0 }};
 
     function nowLabel() {{
@@ -1158,6 +1090,41 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     refreshFloatingAlert();
     setInterval(refreshFloatingAlert, 20000);
 
+    async function abrirEstadisticas() {{
+      const modal = document.getElementById('statsModal');
+      const body = document.getElementById('statsBody');
+      const totalEl = document.getElementById('statsTotal');
+      body.innerHTML = '<div class="stats-loading">Cargando estad&#237;sticas...</div>';
+      totalEl.textContent = '';
+      modal.classList.add('active');
+      try {{
+        const data = await fetch('/api/estadisticas').then(r => r.json());
+        const items = data.tipos || [];
+        const total = data.total || 0;
+        if (items.length === 0) {{
+          body.innerHTML = '<div class="stats-loading">No hay datos disponibles.</div>';
+          return;
+        }}
+        const maxCount = items[0].count || 1;
+        const rows = items.map((item) => {{
+          const pct = Math.round((item.count / maxCount) * 100);
+          return `<tr><td>${{item.tipo}}</td><td class="count-cell">${{item.count}}<span class="stats-bar-wrap"><span class="stats-bar" style="width:${{pct}}%"></span></span></td></tr>`;
+        }}).join('');
+        body.innerHTML = `<div class="table-wrap" style="max-height:55vh"><table class="stats-table"><thead><tr><th>Tipo de documento</th><th style="text-align:right">Cantidad</th></tr></thead><tbody>${{rows}}</tbody></table></div>`;
+        totalEl.textContent = `Total: ${{total}} notificaci&#243;n(es) en ${{items.length}} tipo(s)`;
+      }} catch (e) {{
+        body.innerHTML = '<div class="stats-loading">No se pudo cargar las estad&#237;sticas.</div>';
+      }}
+    }}
+
+    function _cerrarStatsIfBackdrop(evt) {{
+      if (evt && evt.target === document.getElementById('statsModal')) cerrarEstadisticas();
+    }}
+
+    function cerrarEstadisticas() {{
+      document.getElementById('statsModal').classList.remove('active');
+    }}
+
     async function toggleDocs(btn, numero, rowId) {{
       const row = document.getElementById(`docs-row-${{rowId}}`);
       const body = document.getElementById(`docs-body-${{rowId}}`);
@@ -1259,6 +1226,43 @@ def pending_status():
         "minutes_since_last_sync": minutes_since_last_sync,
         "stale_after_minutes": REMOTE_CHECK_STALE_MINUTES,
     })
+
+
+@app.get("/api/estadisticas")
+def estadisticas():
+  """Retorna conteo de notificaciones por tipo de documento inferido."""
+  if not DB_PATH.exists():
+    return JSONResponse({"tipos": [], "total": 0})
+  try:
+    con = _connect()
+    rows = con.execute(
+      "SELECT nro__notificacion, asunto FROM notificaciones WHERE nro__notificacion IS NOT NULL"
+    ).fetchall()
+    con.close()
+  except Exception:
+    return JSONResponse({"tipos": [], "total": 0})
+
+  counts: Counter = Counter()
+  seen: set[str] = set()
+  for row in rows:
+    nro = str(row["nro__notificacion"] or "").strip()
+    if not nro or nro in seen:
+      continue
+    seen.add(nro)
+    asunto = str(row["asunto"] or "").strip()
+    # Try to get doc type from downloaded files first, fall back to asunto
+    files = _build_notification_files_metadata(nro)
+    if files:
+      tipo = files[0].get("document_type") or _infer_document_type(asunto)
+    else:
+      tipo = _infer_document_type(asunto)
+    counts[tipo] += 1
+
+  tipos = sorted(
+    [{"tipo": t, "count": c} for t, c in counts.items()],
+    key=lambda x: -x["count"],
+  )
+  return JSONResponse({"tipos": tipos, "total": len(seen)})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1460,51 +1464,6 @@ def documentos(numero: str) -> HTMLResponse:
 </div>
 """
     return _html_page(f"Documentos {numero}", body)
-
-
-@app.get("/api/estadisticas")
-def estadisticas():
-    """Devuelve conteo de documentos por tipo de documento."""
-    if not DB_PATH.exists():
-        return JSONResponse({"tipos": [], "total": 0})
-
-    with _connect() as con:
-        columns = _get_table_columns(con)
-        notif_col = _find_notification_column(columns)
-        if not notif_col:
-            return JSONResponse({"tipos": [], "total": 0})
-        rows = con.execute(
-            f"SELECT DISTINCT {notif_col}, asunto FROM notificaciones "
-            f"WHERE {notif_col} IS NOT NULL AND TRIM({notif_col}) <> ''"
-        ).fetchall()
-
-    counts: dict[str, int] = {}
-    total_docs = 0
-    for row in rows:
-        numero = str(row[0] or "").strip()
-        asunto = str(row[1] or "").strip()
-        if not numero:
-            continue
-        files = _build_notification_files_metadata(numero)
-        if files:
-            for f in files:
-                total_docs += 1
-                t = f.get("document_type") or _infer_document_type(asunto)
-                if not t or t == "No identificado":
-                    t = "Otro"
-                counts[t] = counts.get(t, 0) + 1
-        else:
-            t = _infer_document_type(asunto) or "Otro"
-            if t == "No identificado":
-                t = "Otro"
-            counts[t] = counts.get(t, 0) + 1
-            total_docs += 1
-
-    sorted_tipos = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    return JSONResponse({
-        "tipos": [{"tipo": k, "cantidad": v} for k, v in sorted_tipos],
-        "total": total_docs,
-    })
 
 
 @app.get("/api/notificaciones/{numero}/documentos")
