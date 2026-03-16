@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import os
 import time
 import unicodedata
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin
@@ -13,8 +15,13 @@ import requests
 from bs4 import BeautifulSoup
 
 try:
+    from openpyxl import Workbook  # type: ignore[import-not-found]
+except Exception:
+    Workbook = None
+
+try:
     from selenium import webdriver
-    from selenium.common.exceptions import TimeoutException
+    from selenium.common.exceptions import NoAlertPresentException, TimeoutException, UnexpectedAlertPresentException
     from selenium.webdriver import ActionChains
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
@@ -23,6 +30,8 @@ try:
 except Exception:
     webdriver = None
     TimeoutException = Exception
+    UnexpectedAlertPresentException = Exception
+    NoAlertPresentException = Exception
     ActionChains = None
     By = None
     Keys = None
@@ -47,11 +56,8 @@ class AuthConfig:
     open_sne_after_login: bool = True
     require_sne_click_navigation: bool = True
     sne_menu_selector: str = (
-        "//mat-nav-list[@role='navigation']"
-        "//mat-list-item[.//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') "
-        "and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']]"
-        "//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') "
-        "and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']"
+        "//div[@matlistitemtitle and contains(@class,'text-menu-parent') "
+        "and contains(normalize-space(),'Casilla') and contains(normalize-space(),'SNE')]"
     )
     sne_target_url: str = "https://notificaciones.osinergmin.gob.pe/sne-web/pages/notificacion/inicio"
     sne_expected_text: str = "Sistema de Notificaciones Electrónicas|Bandeja de Entrada"
@@ -59,7 +65,14 @@ class AuthConfig:
     fecha_notificacion_fin: str = ""
     sne_fecha_inicio_id: str = "fechaNotificacionInicio"
     sne_fecha_fin_id: str = "fechaNotificacionFin"
+    sne_leido_value: str = ""
     sne_buscar_button_id: str = "buscar-boton"
+    sne_export_excel_selector: str = (
+        "//div[contains(@class,'ui-pg-div') and .//span[contains(@class,'ui-icon-arrowthickstop-1-s')] "
+        "and contains(normalize-space(.), 'Exportar a Excel')]"
+    )
+    download_dir: str = "downloads"
+    export_wait_seconds: int = 40
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -160,17 +173,29 @@ def _login_with_requests(session: requests.Session, cfg: AuthConfig, username: s
     return _is_authenticated_by_url(check.url, cfg.success_url_keyword)
 
 
-def _new_driver(headless: bool):
+def _new_driver(cfg: AuthConfig):
     if webdriver is None:
         raise RuntimeError("Selenium no esta disponible en el entorno.")
 
+    download_path = Path(cfg.download_dir).expanduser().resolve()
+    download_path.mkdir(parents=True, exist_ok=True)
+
     options = webdriver.ChromeOptions()
-    if headless:
+    if cfg.selenium_headless:
         options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_experimental_option(
+        "prefs",
+        {
+            "download.default_directory": str(download_path),
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "safebrowsing.enabled": True,
+        },
+    )
     return webdriver.Chrome(options=options)
 
 
@@ -348,19 +373,446 @@ def _set_input_value(driver, element, value: str) -> None:
     try:
         element.send_keys(value)
     except Exception:
+        pass
+
+    # Dispara eventos necesarios para frameworks como jQuery datepicker.
+    try:
         driver.execute_script(
-            "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles: true})); arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+            """
+const el = arguments[0];
+const val = arguments[1];
+if (el.value !== val) { el.value = val; }
+['input','change','blur'].forEach((t) => {
+    el.dispatchEvent(new Event(t, { bubbles: true }));
+});
+""",
             element,
             value,
         )
+    except Exception:
+        pass
+
+
+def _accept_browser_alert_if_present(driver, expected_text: str = "") -> str:
+    """Acepta alertas del navegador para evitar que rompan el flujo Selenium."""
+    try:
+        alert = driver.switch_to.alert
+        text = (alert.text or "").strip()
+        alert.accept()
+
+        if expected_text and expected_text.lower() in text.lower():
+            logging.info("Alerta esperada detectada y aceptada: %s", text)
+        elif text:
+            logging.warning("Alerta detectada y aceptada: %s", text)
+
+        return text
+    except NoAlertPresentException:
+        return ""
+    except Exception:
+        return ""
+
+
+def _snapshot_downloads(download_dir: Path) -> dict[str, float]:
+    snapshot: dict[str, float] = {}
+    if not download_dir.exists():
+        return snapshot
+
+    for file_path in download_dir.iterdir():
+        if not file_path.is_file():
+            continue
+        try:
+            snapshot[file_path.name] = file_path.stat().st_mtime
+        except OSError:
+            continue
+    return snapshot
+
+
+def _wait_for_new_download(download_dir: Path, before: dict[str, float], timeout_seconds: int) -> Path | None:
+    end_time = time.time() + timeout_seconds
+    temp_suffixes = (".crdownload", ".tmp", ".part")
+
+    while time.time() < end_time:
+        if not download_dir.exists():
+            time.sleep(0.25)
+            continue
+
+        candidates: list[Path] = []
+        for file_path in download_dir.iterdir():
+            if not file_path.is_file():
+                continue
+            if file_path.name.lower().endswith(temp_suffixes):
+                continue
+            candidates.append(file_path)
+
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for file_path in candidates:
+            try:
+                current_mtime = file_path.stat().st_mtime
+            except OSError:
+                continue
+
+            previous_mtime = before.get(file_path.name)
+            if previous_mtime is None or current_mtime > previous_mtime:
+                return file_path
+
+        time.sleep(0.5)
+
+    return None
+
+
+def _get_sne_grid_snapshot(driver) -> tuple[str, tuple[str, ...]]:
+    """Captura un estado simple del grid para detectar si la busqueda realmente refresco."""
+    try:
+        snapshot = driver.execute_script(
+            """
+const pagerCandidates = Array.from(document.querySelectorAll("td[id$='_right'], .ui-paging-info"));
+const pagerText = pagerCandidates.map((el) => (el.textContent || '').trim()).find(Boolean) || '';
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const rows = Array.from(document.querySelectorAll('table.ui-jqgrid-btable tr.jqgrow'))
+        .filter((row) => isVisible(row))
+    .map((row) => (row.textContent || '').replace(/\\s+/g, ' ').trim())
+    .filter(Boolean)
+  .filter(Boolean)
+  .slice(0, 5);
+return { pagerText, rows };
+"""
+        )
+        pager_text = (snapshot or {}).get("pagerText", "")
+        rows = tuple((snapshot or {}).get("rows", []))
+        return pager_text, rows
+    except Exception:
+        return "", tuple()
+
+
+def _get_sne_grid_runtime_state(driver) -> tuple[bool, str, int]:
+        """Devuelve estado de carga y un resumen del grid para confirmar refresco."""
+        try:
+                state = driver.execute_script(
+                        """
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0;
+};
+
+const loadingEls = Array.from(document.querySelectorAll("div[id^='load_'], div[id^='lui_'], .loading"));
+const loadingVisible = loadingEls.some((el) => isVisible(el));
+const pagerText = (Array.from(document.querySelectorAll("td[id$='_right'], .ui-paging-info"))
+    .map((el) => (el.textContent || '').trim())
+    .find(Boolean)) || '';
+const rowCount = Array.from(document.querySelectorAll('table.ui-jqgrid-btable tr.jqgrow'))
+        .filter((row) => isVisible(row))
+        .length;
+return { loadingVisible, pagerText, rowCount };
+"""
+                )
+                return bool((state or {}).get("loadingVisible")), str((state or {}).get("pagerText", "")), int((state or {}).get("rowCount", 0))
+        except Exception:
+                return False, "", 0
+
+
+def _click_search_button_and_wait(driver, buscar, cfg: AuthConfig) -> bool:
+    """Hace clic real en Buscar y espera a que el listado del SNE se refresque."""
+    before_snapshot = _get_sne_grid_snapshot(driver)
+
+    def _js_click_buscar(fallback):
+        try:
+            return bool(driver.execute_script(
+                """
+const fallback = arguments[0];
+const target = document.getElementById('buscar-boton')
+    || Array.from(document.querySelectorAll("input[type='button'], button"))
+        .find((node) => ((node.value || node.textContent || '').trim() === 'Buscar'))
+    || fallback;
+
+if (!target) return false;
+
+try { target.scrollIntoView({ block: 'center' }); } catch (e) {}
+try { target.focus(); } catch (e) {}
+
+['pointerdown','mousedown','pointerup','mouseup','click'].forEach((type) => {
+    target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+});
+
+if (window.jQuery) {
+    try { window.jQuery(target).trigger('click'); } catch (e) {}
+}
+try {
+    if (typeof target.onclick === 'function') { target.onclick(); }
+} catch (e) {}
+
+try { target.click(); } catch (e) {}
+return true;
+""",
+                fallback,
+            ))
+        except Exception:
+            return False
+
+    for _ in range(2):
+        clicked = _js_click_buscar(buscar) or _click_ingresar_button(driver, buscar)
+        if not clicked:
+            continue
+
+        loading_seen = False
+        end_time = time.time() + cfg.timeout
+        while time.time() < end_time:
+            loading_visible, pager_text, row_count = _get_sne_grid_runtime_state(driver)
+            if loading_visible:
+                loading_seen = True
+            if loading_seen and not loading_visible:
+                return True
+
+            after_snapshot = _get_sne_grid_snapshot(driver)
+            if after_snapshot != before_snapshot and any(after_snapshot):
+                return True
+
+            # Si el grid ya tiene estado legible, damos por aceptada la recarga.
+            if pager_text and row_count >= 0:
+                if loading_seen:
+                    return True
+
+            time.sleep(0.25)
+
+    return False
+
+
+def _click_export_excel_button(driver, export_btn) -> bool:
+    """Hace clic sobre el div exacto de Exportar a Excel con una ruta JS mas robusta."""
+    if export_btn is None:
+        return False
+
+    if _click_ingresar_button(driver, export_btn):
+        return True
+
+    try:
+        clicked = driver.execute_script(
+            """
+const fallback = arguments[0];
+const nodes = Array.from(document.querySelectorAll('div.ui-pg-div'));
+const target = nodes.find((node) => {
+    const text = (node.textContent || '').replace(/\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+    return text.includes('Exportar a Excel') && node.querySelector('span.ui-icon.ui-icon-arrowthickstop-1-s');
+}) || fallback;
+
+if (!target) return false;
+
+try { target.scrollIntoView({ block: 'center' }); } catch (e) {}
+try { target.focus(); } catch (e) {}
+
+['pointerdown','mousedown','pointerup','mouseup','click'].forEach((type) => {
+    target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+});
+
+try { target.click(); } catch (e) {}
+return true;
+""",
+            export_btn,
+        )
+        return bool(clicked)
+    except Exception:
+        return False
+
+
+def _collect_filtered_grid_rows(driver, cfg: AuthConfig) -> tuple[list[str], list[list[str]]]:
+    """Recorre el jqGrid paginado y devuelve todas las filas del resultado filtrado."""
+    headers: list[str] = []
+    all_rows: list[list[str]] = []
+    seen_pages: set[str] = set()
+
+    def _read_page() -> tuple[str, list[str], list[list[str]]]:
+        try:
+            snapshot = driver.execute_script(
+                """
+const clean = (v) => (v || '').replace(/\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const pagerText = (Array.from(document.querySelectorAll("td[id$='_right'], .ui-paging-info"))
+    .map((el) => clean(el.textContent))
+    .find(Boolean)) || '';
+
+const headerRow = document.querySelector('table.ui-jqgrid-htable tr.ui-jqgrid-labels');
+const headers = headerRow
+    ? Array.from(headerRow.querySelectorAll('th')).map((th) => clean(th.textContent))
+    : [];
+
+const rows = Array.from(document.querySelectorAll('table.ui-jqgrid-btable tr.jqgrow'))
+    .filter((tr) => isVisible(tr))
+    .map((tr) => Array.from(tr.querySelectorAll('td')).map((td) => clean(td.textContent)))
+    .filter((cells) => cells.some((v) => v));
+
+return { pagerText, headers, rows };
+"""
+            )
+            return str((snapshot or {}).get("pagerText", "")), list((snapshot or {}).get("headers", [])), list((snapshot or {}).get("rows", []))
+        except Exception:
+            return "", [], []
+
+    def _click_next_page() -> bool:
+        try:
+            result = driver.execute_script(
+                """
+const buttons = Array.from(document.querySelectorAll('td.ui-pg-button'));
+const nextBtn = buttons.find((td) => /_next$/i.test(td.id || '') || td.querySelector('.ui-icon-seek-next'));
+if (!nextBtn) return false;
+if (nextBtn.classList.contains('ui-state-disabled') || (nextBtn.getAttribute('aria-disabled') || '') === 'true') {
+    return false;
+}
+try { nextBtn.scrollIntoView({ block: 'center' }); } catch (e) {}
+['pointerdown','mousedown','pointerup','mouseup','click'].forEach((type) => {
+    nextBtn.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+});
+try { nextBtn.click(); } catch (e) {}
+return true;
+"""
+            )
+            return bool(result)
+        except Exception:
+            return False
+
+    for _ in range(200):
+        pager_text, page_headers, page_rows = _read_page()
+        page_key = pager_text or f"rows:{len(page_rows)}:{len(all_rows)}"
+        if page_key in seen_pages:
+            break
+        seen_pages.add(page_key)
+
+        if page_headers and not headers:
+            headers = page_headers
+        if page_rows:
+            all_rows.extend(page_rows)
+
+        if not _click_next_page():
+            break
+
+        end_time = time.time() + cfg.timeout
+        while time.time() < end_time:
+            new_pager_text, _, _ = _read_page()
+            if new_pager_text != pager_text:
+                break
+            time.sleep(0.2)
+
+    if not headers and all_rows:
+        headers = [f"Columna {i + 1}" for i in range(len(all_rows[0]))]
+
+    # Elimina columnas completamente vacias (ej. checkbox/acciones) para un Excel limpio.
+    if headers and all_rows:
+        keep_idx: list[int] = []
+        col_count = min(len(headers), min(len(r) for r in all_rows))
+        for i in range(col_count):
+            header = (headers[i] or "").strip()
+            has_value = any((r[i] or "").strip() for r in all_rows)
+            if header or has_value:
+                keep_idx.append(i)
+
+        if keep_idx:
+            headers = [headers[i] for i in keep_idx]
+            all_rows = [[row[i] for i in keep_idx] for row in all_rows]
+
+    return headers, all_rows
+
+
+def _get_visible_grid_status(driver) -> tuple[int, str, bool, bool]:
+    """Lee estado visible del listado: filas, pager, bandera sin resultados y bandera pager con datos."""
+    try:
+        status = driver.execute_script(
+            """
+const normalize = (v) => (v || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+const clean = (v) => (v || '').replace(/\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+
+const rows = Array.from(document.querySelectorAll('table.ui-jqgrid-btable tr.jqgrow'))
+    .filter((tr) => isVisible(tr))
+    .map((tr) => Array.from(tr.querySelectorAll('td')).map((td) => clean(td.textContent)));
+
+const dataRows = rows.filter((cells) => {
+    // Ignora celdas vacias (checkbox/acciones) y exige al menos una celda con contenido real.
+    const realCells = cells.slice(2);
+    return realCells.some((v) => v);
+});
+
+const pagerText = (Array.from(document.querySelectorAll("td[id$='_right'], .ui-paging-info"))
+    .map((el) => clean(el.textContent))
+    .find(Boolean)) || '';
+
+const noResultText = (Array.from(document.querySelectorAll("td[id$='_records'], td[id$='_right'], .ui-paging-info, .ui-jqgrid-bdiv"))
+    .map((el) => normalize(el.textContent))
+    .find((t) => t.includes('no se encontro resultados') || t.includes('no se encontraron resultados'))) || '';
+
+const hasPagerResults = /^mostrando\\s+\\d+\\s*-\\s*\\d+\\s+de\\s+\\d+$/i.test(clean(pagerText));
+
+return {
+    rowCount: dataRows.length,
+    pagerText,
+    noResults: !!noResultText,
+    hasPagerResults,
+};
+"""
+        )
+        return (
+            int((status or {}).get("rowCount", 0)),
+            str((status or {}).get("pagerText", "")),
+            bool((status or {}).get("noResults", False)),
+            bool((status or {}).get("hasPagerResults", False)),
+        )
+    except Exception:
+        return 0, "", False, False
+
+
+def _export_filtered_rows_to_excel(download_dir: Path, headers: list[str], rows: list[list[str]]) -> Path:
+    """Genera un Excel local con el resultado exacto del grid filtrado."""
+    download_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    if Workbook is None:
+        output_path = download_dir / f"Notificaciones Filtradas {stamp}.csv"
+        with output_path.open("w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.writer(fh)
+            if headers:
+                writer.writerow(headers)
+            writer.writerows(rows)
+        return output_path
+
+    output_path = download_dir / f"Notificaciones Filtradas {stamp}.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Notificaciones Filtradas"
+
+    if headers:
+        ws.append(headers)
+    for row in rows:
+        ws.append(row)
+
+    wb.save(output_path)
+    return output_path
 
 
 def _apply_sne_filters(driver, cfg: AuthConfig) -> bool:
     """Llena fechas y ejecuta la busqueda en la bandeja del SNE."""
-    if not cfg.fecha_notificacion_inicio and not cfg.fecha_notificacion_fin:
-        return True
+    now = datetime.now()
+    today = now.strftime("%d/%m/%Y")
+    default_inicio = f"15/{now.month:02d}/{now.year}"
+    fecha_inicio = cfg.fecha_notificacion_inicio or default_inicio
+    fecha_fin = cfg.fecha_notificacion_fin or today
 
-    if not cfg.fecha_notificacion_inicio or not cfg.fecha_notificacion_fin:
+    if not fecha_inicio or not fecha_fin:
         logging.warning("Se omite la busqueda en SNE porque falta una de las dos fechas requeridas.")
         return False
 
@@ -380,22 +832,158 @@ def _apply_sne_filters(driver, cfg: AuthConfig) -> bool:
         logging.warning("No se encontraron los campos de fecha o el boton Buscar en la bandeja del SNE.")
         return False
 
-    _set_input_value(driver, inicio, cfg.fecha_notificacion_inicio)
-    _set_input_value(driver, fin, cfg.fecha_notificacion_fin)
+    def _apply_filter_values() -> None:
+        # Usa la API de jQuery datepicker para asegurar la fecha correcta (evita interferencia del picker).
+        for campo, valor in [(inicio, fecha_inicio), (fin, fecha_fin)]:
+            try:
+                driver.execute_script(
+                    """
+const el = arguments[0];
+const val = arguments[1];
+el.value = val;
+if (window.jQuery) {
+    try {
+        const parts = val.split('/');
+        const d = new Date(parseInt(parts[2]), parseInt(parts[1]) - 1, parseInt(parts[0]));
+        jQuery(el).datepicker('setDate', d);
+    } catch(e) {}
+}
+['input', 'change', 'blur'].forEach((t) => {
+    el.dispatchEvent(new Event(t, { bubbles: true }));
+});
+""",
+                    campo,
+                    valor,
+                )
+            except Exception:
+                pass
+
+        # Selecciona estado de lectura en el filtro del SNE.
+        try:
+            select_leido = driver.find_element(By.ID, "leidoNotificacion")
+            leido_value = (cfg.sne_leido_value or "").strip()
+            driver.execute_script(
+                """
+const sel = arguments[0];
+const val = arguments[1];
+sel.value = val;
+['change', 'input'].forEach((t) => sel.dispatchEvent(new Event(t, { bubbles: true })));
+""",
+                select_leido,
+                leido_value,
+            )
+            logging.info("Filtro de lectura aplicado en leidoNotificacion: '%s'.", leido_value or "Todos")
+        except Exception as exc:
+            logging.warning("No se pudo seleccionar estado de lectura en leidoNotificacion: %s", exc)
+
     logging.info(
         "Fechas de notificacion cargadas en SNE: inicio=%s fin=%s",
-        cfg.fecha_notificacion_inicio,
-        cfg.fecha_notificacion_fin,
+        fecha_inicio,
+        fecha_fin,
     )
 
-    if not _click_ingresar_button(driver, buscar):
-        try:
-            driver.execute_script("arguments[0].click();", buscar)
-        except Exception:
-            logging.warning("No se pudo hacer clic en el boton Buscar del SNE.")
-            return False
+    headers: list[str] = []
+    rows: list[list[str]] = []
+    max_attempts = 4
+    for intento in range(1, max_attempts + 1):
+        _apply_filter_values()
 
-    logging.info("Busqueda ejecutada en la bandeja del SNE.")
+        # Replica el comportamiento manual: dos clics secuenciales en Buscar.
+        search_clicked = False
+        visible_rows = 0
+        pager_text = ""
+        no_results = False
+        has_pager_results = False
+        for subintento in range(1, 4):
+            first_click = _click_search_button_and_wait(driver, buscar, cfg)
+            time.sleep(1.2)
+            second_click = _click_search_button_and_wait(driver, buscar, cfg)
+
+            search_clicked = search_clicked or first_click or second_click
+
+            # Espera corta de estabilizacion para que jqGrid renderice filas visibles.
+            end_wait = time.time() + max(2.5, cfg.timeout / 3)
+            while time.time() < end_wait:
+                visible_rows, pager_text, no_results, has_pager_results = _get_visible_grid_status(driver)
+                if visible_rows > 0 and not no_results and has_pager_results:
+                    break
+                time.sleep(0.25)
+
+            logging.info(
+                "Estado visible del grid tras doble Buscar (ciclo %s/3, intento %s/%s): filas=%s, pager='%s', no_results=%s, pager_ok=%s",
+                subintento,
+                intento,
+                max_attempts,
+                visible_rows,
+                pager_text,
+                no_results,
+                has_pager_results,
+            )
+
+            if visible_rows > 0 and not no_results and has_pager_results:
+                break
+
+            time.sleep(0.8)
+
+        if not search_clicked:
+            if intento == max_attempts:
+                logging.warning("No se pudo hacer clic en el boton Buscar del SNE.")
+                return False
+            time.sleep(0.5)
+            continue
+
+        if visible_rows <= 0 or no_results or not has_pager_results:
+            if intento < max_attempts:
+                logging.warning("Grid visible sin datos en intento %s; reintentando ciclo completo.", intento)
+                time.sleep(1.0)
+                continue
+
+        headers, rows = _collect_filtered_grid_rows(driver, cfg)
+        if rows:
+            break
+
+        if intento < max_attempts:
+            logging.warning("Busqueda sin filas en intento %s; reintentando clic en Buscar.", intento)
+            time.sleep(0.8)
+
+    if not rows:
+        logging.warning("La busqueda no devolvio filas para exportar en el grid filtrado.")
+        return False
+
+    download_dir = Path(cfg.download_dir).expanduser().resolve()
+    download_dir.mkdir(parents=True, exist_ok=True)
+    downloads_before = _snapshot_downloads(download_dir)
+
+    export_btn = _find_first(
+        driver,
+        [
+            (By.XPATH, "//div[@class='ui-pg-div' and .//span[contains(@class,'ui-icon-arrowthickstop-1-s')] and contains(normalize-space(.), 'Exportar a Excel')]"),
+            (By.XPATH, cfg.sne_export_excel_selector),
+            (By.XPATH, "//div[contains(@class,'ui-pg-div')][.//span[contains(@class,'ui-icon-arrowthickstop-1-s')]]"),
+            (By.XPATH, "//div[contains(@class,'ui-pg-div') and contains(normalize-space(.), 'Exportar a Excel')]"),
+        ],
+        cfg.timeout,
+    )
+    if export_btn is None:
+        logging.warning("No se encontro el boton Exportar a Excel en la bandeja del SNE.")
+        return False
+
+    if not _click_export_excel_button(driver, export_btn):
+        logging.warning("No se pudo hacer clic en Exportar a Excel.")
+        return False
+
+    time.sleep(0.25)
+    alert_text = _accept_browser_alert_if_present(driver, expected_text="No hay datos para exportar")
+    if "no hay datos para exportar" in (alert_text or "").lower():
+        logging.warning("No se descargo Excel porque la plataforma reporto que no hay datos para exportar.")
+        return False
+
+    downloaded_file = _wait_for_new_download(download_dir, downloads_before, cfg.export_wait_seconds)
+    if downloaded_file is None:
+        logging.warning("No se detecto descarga de Excel dentro del tiempo esperado (%ss).", cfg.export_wait_seconds)
+        return False
+
+    logging.info("Exportacion a Excel completada. Archivo descargado: %s", downloaded_file.name)
     return True
 
 
@@ -430,42 +1018,103 @@ return el.querySelector('.mat-mdc-list-item-title, .text-menu-parent') || el;
     return container, title
 
 
-def _find_sne_menu(driver, cfg: AuthConfig):
-    return _find_first(
+def _find_sne_menu(driver, cfg: AuthConfig, per_selector_timeout: int = 2):
+    menu = _find_first(
         driver,
         [
             (By.XPATH, cfg.sne_menu_selector),
+            (By.CSS_SELECTOR, "div[matlistitemtitle].text-menu-parent"),
+            (By.CSS_SELECTOR, "div[matlistitemtitle].text-menu"),
             (
                 By.XPATH,
-                "//mat-nav-list[@role='navigation']//mat-list-item"
-                "[.//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') "
-                "and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']]",
+                "//div[@matlistitemtitle and contains(@class,'text-menu') "
+                "and contains(normalize-space(),'SNE')]",
             ),
             (
                 By.XPATH,
-                "//mat-nav-list[@role='navigation']//div[@matlistitemtitle "
-                "and contains(@class,'mat-mdc-list-item-title') "
-                "and contains(@class,'text-menu-parent') "
-                "and normalize-space()='Casilla Electrónica del SNE']",
+                "//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') "
+                "and contains(normalize-space(),'Casilla') and contains(normalize-space(),'SNE')]",
             ),
             (
                 By.XPATH,
                 "//mat-list-item[.//mat-icon[@data-mat-icon-name='ico-mail'] "
-                "and .//div[normalize-space()='Casilla Electrónica del SNE']]",
+                "and .//div[contains(normalize-space(),'SNE')]]",
             ),
             (
                 By.XPATH,
-                "//div[contains(@class, 'mat-mdc-list-item-title') "
-                "and contains(normalize-space(.), 'Casilla Electrónica del SNE')]",
-            ),
-            (
-                By.XPATH,
-                "//*[contains(normalize-space(.), 'Casilla Electrónica del SNE') "
+                "//*[contains(normalize-space(.), 'Casilla') and contains(normalize-space(.), 'SNE') "
                 "and (self::div or self::span or self::a)]",
             ),
         ],
-        cfg.timeout,
+        per_selector_timeout,
     )
+
+    if menu is not None:
+        return menu
+
+    # Fallback robusto: ubica el titulo visible exacto y devuelve su mat-list-item padre.
+    try:
+        return driver.execute_script(
+            """
+const normalize = (v) => (v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+const wanted = normalize('Casilla Electrónica del SNE');
+const nodes = Array.from(document.querySelectorAll('div[matlistitemtitle].text-menu-parent, div[matlistitemtitle].text-menu, div[matlistitemtitle].mat-mdc-list-item-title, .mat-mdc-list-item-title'));
+
+for (const node of nodes) {
+  const text = normalize(node.textContent || node.innerText || '');
+  const style = window.getComputedStyle(node);
+  const visible = style && style.visibility !== 'hidden' && style.display !== 'none' && node.offsetParent !== null;
+  if (visible && text === wanted) {
+    return node.closest('mat-list-item, .mat-mdc-list-item, .mdc-list-item') || node;
+  }
+}
+
+return null;
+"""
+        )
+    except Exception:
+        return None
+
+
+def _force_click_sne_menu_via_js(driver) -> bool:
+    """Ultimo recurso: clic JS directo sobre el item visible de Casilla SNE."""
+    try:
+        clicked = driver.execute_script(
+            """
+const normalize = (v) => (v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+const wanted = normalize('Casilla Electrónica del SNE');
+const nodes = Array.from(document.querySelectorAll('div[matlistitemtitle].text-menu-parent, div[matlistitemtitle].text-menu, div[matlistitemtitle].mat-mdc-list-item-title, .mat-mdc-list-item-title'));
+
+for (const node of nodes) {
+  const text = normalize(node.textContent || node.innerText || '');
+  const style = window.getComputedStyle(node);
+  const visible = style && style.visibility !== 'hidden' && style.display !== 'none' && node.offsetParent !== null;
+  if (!visible || text !== wanted) continue;
+
+    const candidates = [
+        node,
+        node.closest('a, button, [role="menuitem"], [role="listitem"], mat-list-item, .mat-mdc-list-item, .mdc-list-item, li, div')
+    ].filter(Boolean);
+
+    for (const target of candidates) {
+        try { target.scrollIntoView({ block: 'center' }); } catch (e) {}
+        try { target.focus(); } catch (e) {}
+
+        ['pointerdown','mousedown','pointerup','mouseup','click'].forEach((type) => {
+            target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+        });
+
+        try { target.click(); } catch (e) {}
+        return true;
+    }
+}
+
+return false;
+"""
+        )
+        return bool(clicked)
+    except Exception:
+        return False
 
 
 def _perform_sne_click_attempt(driver, target, description: str, mode: str) -> bool:
@@ -565,9 +1214,11 @@ def _attempt_sne_click_navigation(driver, menu, cfg: AuthConfig, windows_before:
     attempts = [
         (title, "el titulo de Casilla Electrónica del SNE", "selenium"),
         (container, "el contenedor del menu SNE", "selenium"),
+        (title, "el titulo de Casilla Electrónica del SNE", "js-events"),
         (title, "el titulo de Casilla Electrónica del SNE", "js-click"),
         (container, "el contenedor del menu SNE", "js-click"),
         (container, "el contenedor del menu SNE", "js-events"),
+        (title, "el titulo de Casilla Electrónica del SNE", "keyboard"),
         (container, "el contenedor del menu SNE", "keyboard"),
     ]
 
@@ -581,27 +1232,85 @@ def _attempt_sne_click_navigation(driver, menu, cfg: AuthConfig, windows_before:
     return False
 
 
+def _fast_click_sne_menu_via_js(driver, cfg: AuthConfig) -> bool:
+    """Clic rapido JS directo sobre mat-list-item padre del titulo Casilla SNE."""
+    try:
+        return bool(driver.execute_script(
+            """
+const normalize = (v) => (v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toLowerCase();
+const wanted = normalize('Casilla Electrónica del SNE');
+const nodes = Array.from(document.querySelectorAll(
+    'div[matlistitemtitle].text-menu-parent, div[matlistitemtitle].text-menu, div[matlistitemtitle]'
+));
+for (const node of nodes) {
+    if (normalize(node.textContent || '') !== wanted) continue;
+    const item = node.closest('mat-list-item, .mdc-list-item, [role="listitem"]') || node;
+    item.scrollIntoView({ block: 'center' });
+    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach((t) => {
+        item.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+    });
+    item.click();
+    return true;
+}
+return false;
+"""
+        ))
+    except Exception:
+        return False
+
+
 def _click_sne_menu_and_switch_window(driver, cfg: AuthConfig) -> bool:
     """Hace clic en Casilla Electrónica del SNE y cambia a la ventana nueva si se abre."""
     windows_before = driver.window_handles
     url_before = driver.current_url or ""
 
-    try:
-        menu = _find_sne_menu(driver, cfg)
-    except Exception:
-        menu = None
+    # Esperar a que Angular renderice el elemento antes de intentar el clic.
+    sne_selectors = [
+        (By.CSS_SELECTOR, "div[matlistitemtitle].text-menu-parent"),
+        (By.CSS_SELECTOR, "div[matlistitemtitle].text-menu"),
+        (By.XPATH, "//div[@matlistitemtitle and contains(normalize-space(),'SNE')]"),
+    ]
+    for by, val in sne_selectors:
+        try:
+            WebDriverWait(driver, cfg.timeout).until(EC.presence_of_element_located((by, val)))
+            logging.info("Elemento del menu SNE detectado en el DOM.")
+            break
+        except Exception:
+            continue
 
-    if menu is None:
-        logging.warning("No se encontro el menu 'Casilla Electrónica del SNE'.")
-        return False
+    clicked = False
+    deadline = time.time() + max(20, cfg.timeout * 2)
+    while time.time() < deadline and not clicked:
+        # Ruta rapida: JS directo sobre el elemento exacto del DOM.
+        if _fast_click_sne_menu_via_js(driver, cfg):
+            logging.info("Clic JS rapido ejecutado sobre Casilla Electronica del SNE.")
+            clicked = _wait_for_sne_navigation_after_click(driver, cfg, windows_before, url_before)
+            if clicked:
+                break
 
-    clicked = _attempt_sne_click_navigation(driver, menu, cfg, windows_before, url_before)
+        if not clicked:
+            try:
+                menu = _find_sne_menu(driver, cfg, per_selector_timeout=2)
+            except Exception:
+                menu = None
+
+            if menu is not None:
+                clicked = _attempt_sne_click_navigation(driver, menu, cfg, windows_before, url_before)
+
+        if not clicked and _force_click_sne_menu_via_js(driver):
+            clicked = _wait_for_sne_navigation_after_click(driver, cfg, windows_before, url_before)
+
+        if not clicked:
+            time.sleep(0.5)
+
     if not clicked:
-        logging.warning("No se pudo hacer clic en el menu 'Casilla Electrónica del SNE'.")
-        return False
+        if cfg.require_sne_click_navigation:
+            logging.warning("No se pudo hacer clic en el menu 'Casilla Electrónica del SNE'.")
+            return False
+        logging.warning("No se pudo hacer clic en el menu 'Casilla Electrónica del SNE'; se usara navegacion directa.")
 
-    if cfg.sne_target_url:
-        logging.info("Clic automatico realizado en Casilla Electrónica del SNE; abriendo el link objetivo del SNE.")
+    if not clicked and cfg.sne_target_url:
+        logging.info("Abriendo el link objetivo del SNE automaticamente.")
         try:
             driver.get(cfg.sne_target_url)
         except Exception as exc:
@@ -702,7 +1411,8 @@ def _wait_for_login_result(driver, cfg: AuthConfig) -> bool:
 
 
 def _login_with_selenium(session: requests.Session, cfg: AuthConfig, username: str, password: str) -> bool:
-    driver = _new_driver(cfg.selenium_headless)
+    driver = _new_driver(cfg)
+    direct_sne_url = "https://notificaciones.osinergmin.gob.pe/sne-web/pages/notificacion/inicio"
     try:
         driver.get(cfg.login_url)
 
@@ -763,12 +1473,36 @@ def _login_with_selenium(session: requests.Session, cfg: AuthConfig, username: s
             return False
 
         if cfg.open_sne_after_login:
+            # El SNE es un dominio distinto; primero establecemos la sesion SSO
+            # via el portal (necesario para que notificaciones.osinergmin.gob.pe
+            # acepte la sesion), y luego navegamos a la URL exacta solicitada.
             _click_sne_menu_and_switch_window(driver, cfg)
+            logging.info("Redirigiendo a la URL directa del SNE: %s", direct_sne_url)
+            try:
+                driver.get(direct_sne_url)
+            except Exception as exc:
+                logging.warning("No se pudo navegar a la URL directa del SNE: %s", exc)
+                return False
+
+            if not _wait_for_sne_home(driver, cfg):
+                logging.warning("No se pudo validar la pantalla esperada del SNE tras navegar a la URL objetivo.")
+
             _apply_sne_filters(driver, cfg)
 
-        # Copiamos cookies de Selenium a la sesion requests para siguientes pasos.
-        for cookie in driver.get_cookies():
-            session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain"), path=cookie.get("path", "/"))
+        # Limpia cualquier alerta remanente y copia cookies ANTES del sleep,
+        # mientras la sesion Selenium sigue activa.
+        _accept_browser_alert_if_present(driver, expected_text="No hay datos para exportar")
+        try:
+            for cookie in driver.get_cookies():
+                session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain"), path=cookie.get("path", "/"))
+        except Exception:
+            pass
+
+        if cfg.open_sne_after_login:
+            # Deja el navegador abierto 1 minuto para que puedas ver el resultado.
+            logging.info("Esperando 1 minuto para que puedas revisar los resultados en el navegador...")
+            time.sleep(60)
+            logging.info("Cerrando navegador.")
 
         return True
     finally:
@@ -876,11 +1610,8 @@ def main() -> None:
         "--sne-menu-selector",
         default=os.getenv(
             "OSI_SNE_MENU_SELECTOR",
-            "//mat-nav-list[@role='navigation']"
-            "//mat-list-item[.//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') "
-            "and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']]"
-            "//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') "
-            "and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']",
+            "//div[@matlistitemtitle and contains(@class,'text-menu-parent') "
+            "and contains(normalize-space(),'Casilla') and contains(normalize-space(),'SNE')]",
         ),
         help="XPath/CSS (XPath recomendado) del menu SNE (env: OSI_SNE_MENU_SELECTOR)",
     )
@@ -921,9 +1652,33 @@ def main() -> None:
         help="ID del campo fecha final del SNE (env: OSI_SNE_FECHA_FIN_ID)",
     )
     parser.add_argument(
+        "--sne-leido-value",
+        default=os.getenv("OSI_SNE_LEIDO_VALUE", ""),
+        help="Valor del filtro Estado de lectura en SNE (ej.: ''=Todos, 'N'=No leida, 'L'=Leida) (env: OSI_SNE_LEIDO_VALUE)",
+    )
+    parser.add_argument(
         "--sne-buscar-button-id",
         default=os.getenv("OSI_SNE_BUSCAR_BUTTON_ID", "buscar-boton"),
         help="ID del boton Buscar en el SNE (env: OSI_SNE_BUSCAR_BUTTON_ID)",
+    )
+    parser.add_argument(
+        "--sne-export-excel-selector",
+        default=os.getenv(
+            "OSI_SNE_EXPORT_EXCEL_SELECTOR",
+            "//div[contains(@class,'ui-pg-div') and .//span[contains(@class,'ui-icon-arrowthickstop-1-s')] and contains(normalize-space(.), 'Exportar a Excel')]",
+        ),
+        help="XPath/CSS del boton Exportar a Excel (env: OSI_SNE_EXPORT_EXCEL_SELECTOR)",
+    )
+    parser.add_argument(
+        "--download-dir",
+        default=os.getenv("OSI_DOWNLOAD_DIR", "downloads"),
+        help="Carpeta de descargas para exportaciones (env: OSI_DOWNLOAD_DIR)",
+    )
+    parser.add_argument(
+        "--export-wait-seconds",
+        type=int,
+        default=int(os.getenv("OSI_EXPORT_WAIT_SECONDS", "40")),
+        help="Segundos maximos para esperar el archivo Excel descargado (env: OSI_EXPORT_WAIT_SECONDS)",
     )
     parser.add_argument(
         "--user-agent",
@@ -969,7 +1724,11 @@ def main() -> None:
         fecha_notificacion_fin=args.fecha_notificacion_fin,
         sne_fecha_inicio_id=args.sne_fecha_inicio_id,
         sne_fecha_fin_id=args.sne_fecha_fin_id,
+        sne_leido_value=args.sne_leido_value,
         sne_buscar_button_id=args.sne_buscar_button_id,
+        sne_export_excel_selector=args.sne_export_excel_selector,
+        download_dir=args.download_dir,
+        export_wait_seconds=args.export_wait_seconds,
         user_agent=args.user_agent,
     )
 
