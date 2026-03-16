@@ -1030,6 +1030,7 @@ def _save_excel_to_sqlite(excel_path: Path, db_path: Path) -> int:
 
         fecha_importacion = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         count = 0
+        processed_nros: set[str] = set()  # Deduplica filas en el mismo Excel
         for data_row in rows_iter:
             values = [str(v).strip() if v is not None else "" for v in data_row[:len(final_cols)]]
             # Padding si la fila tiene menos columnas
@@ -1038,7 +1039,11 @@ def _save_excel_to_sqlite(excel_path: Path, db_path: Path) -> int:
 
             if nro_col_idx is not None:
                 nro = values[nro_col_idx]
+                # Salta filas duplicadas en el mismo Excel
+                if nro in processed_nros:
+                    continue
                 if nro:
+                    processed_nros.add(nro)
                     # Actualiza si ya existe, inserta si no
                     existing = cur.execute(
                         f'SELECT rowid FROM notificaciones WHERE "{final_cols[nro_col_idx]}" = ?',
@@ -1089,8 +1094,15 @@ def _get_notification_numbers_from_excel(excel_path: Path) -> list[str]:
             if re.fullmatch(r"\d{8,}-\d+", val):
                 numbers.append(val)
         wb.close()
-        logging.info("Numeros de notificacion leidos desde Excel (%s): %s", excel_path.name, numbers)
-        return numbers
+        # Deduplica preservando orden
+        seen: set[str] = set()
+        unique_numbers: list[str] = []
+        for n in numbers:
+            if n not in seen:
+                seen.add(n)
+                unique_numbers.append(n)
+        logging.info("Numeros de notificacion leidos desde Excel (%s): %s unicos de %s totales", excel_path.name, len(unique_numbers), len(numbers))
+        return unique_numbers
     except Exception as exc:
         logging.warning("No se pudo leer numeros de notificacion desde Excel '%s': %s", excel_path, exc)
         return []
@@ -1219,14 +1231,28 @@ return true;
             continue
 
         _accept_browser_alert_if_present(driver)
-        file_path = _wait_for_new_download(download_dir, before, max(10, cfg.export_wait_seconds))
+        # Delay para que el servidor inicie la descarga
+        time.sleep(1.5)
+        # Timeout más largo para PDFs
+        file_path = _wait_for_new_download(download_dir, before, max(60, cfg.export_wait_seconds))
         if file_path is not None:
+            # Verifica que el archivo tenga contenido
+            try:
+                file_size = file_path.stat().st_size
+                if file_size < 100:
+                    logging.warning("Archivo descargado muy pequeño (%d bytes), probablemente corrupto: %s", file_size, file_path.name)
+                    continue
+            except OSError as e:
+                logging.warning("No se pudo verificar tamaño del archivo %s: %s", file_path.name, e)
+                continue
+            
             final_path = _move_download_to_notification_folder(file_path, download_dir, notification_number)
             logging.info(
-                "Archivo movido a carpeta de suministro %s en fecha %s: %s",
+                "Archivo movido a carpeta de suministro %s en fecha %s: %s (%d bytes)",
                 notification_number or "sin-numero",
                 datetime.now().strftime("%Y-%m-%d"),
                 final_path.name,
+                file_size,
             )
             downloaded += 1
 
