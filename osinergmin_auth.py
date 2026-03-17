@@ -5,11 +5,12 @@ import csv
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import time
 import unicodedata
-from datetime import datetime
-from dataclasses import dataclass
+from datetime import datetime, timedelta
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -83,6 +84,32 @@ class AuthConfig:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     )
+
+
+def _parse_ddmmyyyy(raw: str) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw.strip(), "%d/%m/%Y")
+    except ValueError:
+        return None
+
+
+def _parse_iso_date(raw: str) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _resolve_processing_date(cfg: AuthConfig) -> str:
+    """Fecha del lote procesado en formato YYYY-MM-DD (usa fecha_fin del filtro)."""
+    by_filter = _parse_ddmmyyyy(cfg.fecha_notificacion_fin)
+    if by_filter is not None:
+        return by_filter.strftime("%Y-%m-%d")
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -1106,10 +1133,15 @@ return match ? match[0] : '';
     return clean
 
 
-def _move_download_to_notification_folder(file_path: Path, base_download_dir: Path, notification_number: str) -> Path:
+def _move_download_to_notification_folder(
+    file_path: Path,
+    base_download_dir: Path,
+    notification_number: str,
+    processing_date: str,
+) -> Path:
     """Mueve un archivo descargado a /YYYY-MM-DD/numero_suministro/."""
     folder_name = notification_number or "sin-numero-suministro"
-    date_folder = datetime.now().strftime("%Y-%m-%d")
+    date_folder = processing_date
     target_dir = base_download_dir / date_folder / folder_name
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1127,32 +1159,33 @@ def _move_download_to_notification_folder(file_path: Path, base_download_dir: Pa
     return target_path
 
 
-def _get_notifications_with_downloads(base_download_dir: Path) -> set[str]:
-    """Obtiene Nro. Notificacion que ya tienen archivos descargados en la carpeta de HOY.
-    Solo revisa la subcarpeta del dia actual para que cada dia se vuelva a descargar todo."""
+def _get_notifications_with_downloads(base_download_dir: Path, processing_date: str) -> set[str]:
+    """Obtiene Nro. Notificacion que ya tienen archivos descargados en CUALQUIER carpeta de fecha.
+    Revisa todas las subcarpetas de fecha para evitar re-descargar archivos que ya existen."""
     existing: set[str] = set()
     pattern = re.compile(r"\d{8,}-\d+")
-    today_folder = base_download_dir / datetime.now().strftime("%Y-%m-%d")
-    if not today_folder.exists():
+    if not base_download_dir.exists():
         return existing
 
-    for candidate in today_folder.iterdir():
-        if not candidate.is_dir() or not pattern.fullmatch(candidate.name):
+    for date_dir in base_download_dir.iterdir():
+        if not date_dir.is_dir():
             continue
-        try:
-            has_files = any(p.is_file() for p in candidate.iterdir())
-        except Exception:
-            has_files = False
-        if has_files:
-            existing.add(candidate.name)
+        for candidate in date_dir.iterdir():
+            if not candidate.is_dir() or not pattern.fullmatch(candidate.name):
+                continue
+            try:
+                has_files = any(p.is_file() for p in candidate.iterdir())
+            except Exception:
+                has_files = False
+            if has_files:
+                existing.add(candidate.name)
 
     return existing
 
 
-def _normalize_exported_excel_file(download_dir: Path, downloaded_file: Path) -> Path:
+def _normalize_exported_excel_file(download_dir: Path, downloaded_file: Path, processing_date: str) -> Path:
     """Deja un Excel de exportacion con nombre de la fecha actual y elimina copias (1), (2), ..."""
-    today_date = datetime.now().strftime("%Y-%m-%d")
-    canonical = download_dir / f"Notificaciones Electrónicas - {today_date}.xlsx"
+    canonical = download_dir / f"Notificaciones Electrónicas - {processing_date}.xlsx"
 
     try:
         if downloaded_file.resolve() != canonical.resolve():
@@ -1182,9 +1215,64 @@ def _normalize_exported_excel_file(download_dir: Path, downloaded_file: Path) ->
     return downloaded_file
 
 
-def _save_excel_to_sqlite(excel_path: Path, db_path: Path) -> int:
-    """Lee el Excel exportado y guarda/actualiza todas las filas en SQLite.
-    Retorna la cantidad de filas insertadas o actualizadas."""
+def _create_empty_daily_excel(download_dir: Path, processing_date: str) -> Path:
+    """Crea un Excel diario vacio para marcar que no hubo datos ese dia."""
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    if Workbook is None:
+        output_path = download_dir / f"Notificaciones Electrónicas - {processing_date}.csv"
+        if not output_path.exists():
+            output_path.write_text("", encoding="utf-8")
+        return output_path
+
+    output_path = download_dir / f"Notificaciones Electrónicas - {processing_date}.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Notificaciones"
+    wb.save(output_path)
+    return output_path
+
+
+def _cleanup_day_notification_folders(base_download_dir: Path, processing_date: str) -> int:
+    """Elimina carpetas de notificaciones del dia cuando la consulta no devuelve datos."""
+    day_dir = base_download_dir / processing_date
+    if not day_dir.exists() or not day_dir.is_dir():
+        return 0
+
+    removed = 0
+    for candidate in day_dir.iterdir():
+        if not candidate.is_dir():
+            continue
+        try:
+            shutil.rmtree(candidate)
+            removed += 1
+        except Exception:
+            continue
+    return removed
+
+
+def _clear_processing_date_rows(db_path: Path, processing_date: str) -> None:
+    """Limpia filas del dia en SQLite cuando no hubo resultados en esa fecha."""
+    if not processing_date:
+        return
+
+    if not db_path.exists():
+        return
+
+    try:
+        con = sqlite3.connect(str(db_path))
+        cur = con.cursor()
+        existing_cols = {row[1].lower() for row in cur.execute('PRAGMA table_info(notificaciones)')}
+        if "processing_date" in existing_cols:
+            cur.execute('DELETE FROM notificaciones WHERE processing_date = ?', (processing_date,))
+            con.commit()
+        con.close()
+    except Exception as exc:
+        logging.warning("No se pudo limpiar SQLite para fecha %s: %s", processing_date, exc)
+
+
+def _save_excel_to_sqlite(excel_path: Path, db_path: Path, processing_date: str | None = None) -> int:
+    """Lee el Excel exportado y guarda/actualiza filas en SQLite separadas por dia."""
     try:
         import openpyxl  # type: ignore[import-not-found]
         wb = openpyxl.load_workbook(excel_path, data_only=True)
@@ -1197,14 +1285,13 @@ def _save_excel_to_sqlite(excel_path: Path, db_path: Path) -> int:
             logging.warning("Excel vacio, no se guardo nada en SQLite.")
             return 0
 
-        # Normaliza cabeceras para usar como columnas SQL
+        # Normaliza cabeceras para usar como columnas SQL.
         def _col_name(h: object, idx: int) -> str:
             s = re.sub(r"[^\w]", "_", unicodedata.normalize("NFD", str(h or f"col_{idx}"))
                        .encode("ascii", "ignore").decode())
             return (s.strip("_") or f"col_{idx}").lower()
 
         col_names = [_col_name(h, i) for i, h in enumerate(raw_headers)]
-        # Elimina columnas duplicadas o vacias
         seen_cols: set[str] = set()
         final_cols: list[str] = []
         for c in col_names:
@@ -1224,67 +1311,90 @@ def _save_excel_to_sqlite(excel_path: Path, db_path: Path) -> int:
         col_defs = ", ".join(f'"{c}" TEXT' for c in final_cols)
         cur.execute(f'CREATE TABLE IF NOT EXISTS notificaciones ({col_defs})')
 
-        # Agrega columnas nuevas si la tabla ya existia con menos columnas
         existing_cols = {row[1].lower() for row in cur.execute('PRAGMA table_info(notificaciones)')}
         for c in final_cols:
             if c.lower() not in existing_cols:
                 cur.execute(f'ALTER TABLE notificaciones ADD COLUMN "{c}" TEXT')
 
-        # Columna de fecha de importacion
         if "fecha_importacion" not in existing_cols:
             try:
                 cur.execute('ALTER TABLE notificaciones ADD COLUMN "fecha_importacion" TEXT')
             except sqlite3.OperationalError:
                 pass
 
+        if "processing_date" not in existing_cols:
+            try:
+                cur.execute('ALTER TABLE notificaciones ADD COLUMN "processing_date" TEXT')
+            except sqlite3.OperationalError:
+                pass
+
+        # Encuentra indice de la columna de fecha de notificacion para asignar processing_date real.
+        notif_date_col_idx: int | None = None
+        for _i, _c in enumerate(final_cols):
+            if _c.lower() in {"fecha_de_notificacion", "fecha_notificacion"}:
+                notif_date_col_idx = _i
+                break
+
+        _date_fmts = (
+            "%d/%m/%Y %I:%M:%S %p",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d",
+        )
+
+        def _derive_row_date(values: list[str]) -> str:
+            if notif_date_col_idx is not None and notif_date_col_idx < len(values):
+                raw = values[notif_date_col_idx].strip()
+                for _fmt in _date_fmts:
+                    try:
+                        return datetime.strptime(raw, _fmt).strftime("%Y-%m-%d")
+                    except (ValueError, AttributeError):
+                        continue
+            return processing_date or ""
+
+        # Lee todas las filas en memoria para determinar las fechas reales antes de limpiar BD.
+        all_data_rows: list[list[str]] = []
+        for data_row in rows_iter:
+            vals = [str(v).strip() if v is not None else "" for v in data_row[:len(final_cols)]]
+            while len(vals) < len(final_cols):
+                vals.append("")
+            all_data_rows.append(vals)
+
+        row_dates = [_derive_row_date(v) for v in all_data_rows]
+
+        # Limpia registros de la fecha filtro Y de las fechas reales encontradas en los datos.
+        dates_to_clean: set[str] = {d for d in row_dates if d}
+        if processing_date:
+            dates_to_clean.add(processing_date)
+        for _d in dates_to_clean:
+            try:
+                cur.execute('DELETE FROM notificaciones WHERE processing_date = ?', (_d,))
+            except sqlite3.OperationalError:
+                pass
+
         placeholders = ", ".join("?" for _ in final_cols)
         col_list = ", ".join(f'"{c}"' for c in final_cols)
-        insert_sql = f'INSERT INTO notificaciones ({col_list}, "fecha_importacion") VALUES ({placeholders}, ?)'
-
-        # Detecta columna nro_notificacion para upsert
-        nro_col_idx: int | None = None
-        for i, c in enumerate(final_cols):
-            if "notif" in c:
-                nro_col_idx = i
-                break
+        insert_sql = (
+            f'INSERT INTO notificaciones ({col_list}, "fecha_importacion", "processing_date") '
+            f'VALUES ({placeholders}, ?, ?)'
+        )
 
         fecha_importacion = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         count = 0
-        processed_nros: set[str] = set()  # Deduplica filas en el mismo Excel
-        for data_row in rows_iter:
-            values = [str(v).strip() if v is not None else "" for v in data_row[:len(final_cols)]]
-            # Padding si la fila tiene menos columnas
-            while len(values) < len(final_cols):
-                values.append("")
-
-            if nro_col_idx is not None:
-                nro = values[nro_col_idx]
-                # Salta filas duplicadas en el mismo Excel
-                if nro in processed_nros:
-                    continue
-                if nro:
-                    processed_nros.add(nro)
-                    # Actualiza si ya existe, inserta si no
-                    existing = cur.execute(
-                        f'SELECT rowid FROM notificaciones WHERE "{final_cols[nro_col_idx]}" = ?',
-                        (nro,),
-                    ).fetchone()
-                    if existing:
-                        set_clause = ", ".join(f'"{c}" = ?' for c in final_cols)
-                        cur.execute(
-                            f'UPDATE notificaciones SET {set_clause}, "fecha_importacion" = ? WHERE rowid = ?',
-                            values + [fecha_importacion, existing[0]],
-                        )
-                        count += 1
-                        continue
-
-            cur.execute(insert_sql, values + [fecha_importacion])
+        for values, row_date in zip(all_data_rows, row_dates):
+            cur.execute(insert_sql, values + [fecha_importacion, row_date])
             count += 1
 
         con.commit()
         con.close()
         wb.close()
-        logging.info("SQLite actualizado (%s): %s filas guardadas en tabla 'notificaciones'.", db_path.name, count)
+        logging.info(
+            "SQLite actualizado (%s): %s filas guardadas en tabla 'notificaciones' para %s.",
+            db_path.name,
+            count,
+            processing_date or "sin-fecha",
+        )
         return count
     except Exception as exc:
         logging.warning("Error guardando Excel en SQLite: %s", exc)
@@ -1377,6 +1487,7 @@ def _download_visible_document_links_for_notification(
     cfg: AuthConfig,
     download_dir: Path,
     notification_number: str,
+    processing_date: str,
 ) -> int:
     """Descarga links visibles de documentos y los organiza por numero de notificacion."""
     downloaded = 0
@@ -1466,11 +1577,16 @@ return true;
                 logging.warning("No se pudo verificar tamaño del archivo %s: %s", file_path.name, e)
                 continue
             
-            final_path = _move_download_to_notification_folder(file_path, download_dir, notification_number)
+            final_path = _move_download_to_notification_folder(
+                file_path,
+                download_dir,
+                notification_number,
+                processing_date,
+            )
             logging.info(
                 "Archivo movido a carpeta de suministro %s en fecha %s: %s (%d bytes)",
                 notification_number or "sin-numero",
-                datetime.now().strftime("%Y-%m-%d"),
+                processing_date,
                 final_path.name,
                 file_size,
             )
@@ -1548,6 +1664,7 @@ def _download_documents_from_visible_results(
     driver,
     cfg: AuthConfig,
     download_dir: Path,
+    processing_date: str,
     notification_numbers: list[str] | None = None,
 ) -> int:
     """Por cada notificacion (del Excel o del grid), abre detalle y descarga sus documentos."""
@@ -1604,6 +1721,7 @@ def _download_documents_from_visible_results(
                 cfg,
                 download_dir,
                 notification_number,
+                processing_date,
             )
             opened_docs = True
             break
@@ -1710,6 +1828,7 @@ def _apply_sne_filters(driver, cfg: AuthConfig) -> bool:
     default_inicio = f"15/{now.month:02d}/{now.year}"
     fecha_inicio = cfg.fecha_notificacion_inicio or default_inicio
     fecha_fin = cfg.fecha_notificacion_fin or today
+    processing_date = _resolve_processing_date(cfg)
 
     if not fecha_inicio or not fecha_fin:
         logging.warning("Se omite la busqueda en SNE porque falta una de las dos fechas requeridas.")
@@ -1846,12 +1965,20 @@ sel.value = val;
             logging.warning("Busqueda sin filas en intento %s; reintentando clic en Buscar.", intento)
             time.sleep(0.8)
 
-    if not rows:
-        logging.warning("La busqueda no devolvio filas para exportar en el grid filtrado.")
-        return False
-
     download_dir = Path(cfg.download_dir).expanduser().resolve()
     download_dir.mkdir(parents=True, exist_ok=True)
+
+    if not rows:
+        empty_file = _create_empty_daily_excel(download_dir, processing_date)
+        removed = _cleanup_day_notification_folders(download_dir, processing_date)
+        _clear_processing_date_rows(download_dir / "notificaciones.db", processing_date)
+        logging.info(
+            "Sin resultados en la busqueda. Archivo diario vacio: %s. Carpetas del dia limpiadas: %s",
+            empty_file.name,
+            removed,
+        )
+        return True
+
     downloads_before = _snapshot_downloads(download_dir)
 
     export_btn = _find_first(
@@ -1875,21 +2002,28 @@ sel.value = val;
     time.sleep(0.25)
     alert_text = _accept_browser_alert_if_present(driver, expected_text="No hay datos para exportar")
     if "no hay datos para exportar" in (alert_text or "").lower():
-        logging.warning("No se descargo Excel porque la plataforma reporto que no hay datos para exportar.")
-        return False
+        empty_file = _create_empty_daily_excel(download_dir, processing_date)
+        removed = _cleanup_day_notification_folders(download_dir, processing_date)
+        _clear_processing_date_rows(download_dir / "notificaciones.db", processing_date)
+        logging.info(
+            "La plataforma reporto que no hay datos para exportar. Archivo diario vacio: %s. Carpetas del dia limpiadas: %s",
+            empty_file.name,
+            removed,
+        )
+        return True
 
     downloaded_file = _wait_for_new_download(download_dir, downloads_before, cfg.export_wait_seconds)
     if downloaded_file is None:
         logging.warning("No se detecto descarga de Excel dentro del tiempo esperado (%ss).", cfg.export_wait_seconds)
         return False
 
-    downloaded_file = _normalize_exported_excel_file(download_dir, downloaded_file)
+    downloaded_file = _normalize_exported_excel_file(download_dir, downloaded_file, processing_date)
 
     logging.info("Exportacion a Excel completada. Archivo descargado: %s", downloaded_file.name)
 
-    # Guarda todas las filas del Excel en SQLite
+    # Guarda todas las filas del Excel en SQLite (aislado por fecha de procesamiento).
     db_path = download_dir / "notificaciones.db"
-    _save_excel_to_sqlite(downloaded_file, db_path)
+    _save_excel_to_sqlite(downloaded_file, db_path, processing_date)
 
     # Usa el Excel como fuente de verdad: contiene TODOS los Nro. Notificacion
     # independientemente de la paginacion del grid.
@@ -1910,7 +2044,7 @@ sel.value = val;
         )
 
     if excel_notification_numbers and (cfg.incremental_only or cfg.skip_existing_notifications):
-        already_downloaded = _get_notifications_with_downloads(download_dir)
+        already_downloaded = _get_notifications_with_downloads(download_dir, processing_date)
         total_before = len(excel_notification_numbers)
         excel_notification_numbers = [n for n in excel_notification_numbers if n not in already_downloaded]
         logging.info(
@@ -1923,7 +2057,13 @@ sel.value = val;
             logging.info("No hay notificaciones nuevas o pendientes por descargar.")
             return True
 
-    docs_downloaded = _download_documents_from_visible_results(driver, cfg, download_dir, excel_notification_numbers)
+    docs_downloaded = _download_documents_from_visible_results(
+        driver,
+        cfg,
+        download_dir,
+        processing_date,
+        excel_notification_numbers,
+    )
     if docs_downloaded > 0:
         logging.info("Descarga de documentos notificados completada. Archivos descargados: %s", docs_downloaded)
     else:
@@ -2137,12 +2277,18 @@ def _wait_for_sne_navigation_after_click(driver, cfg: AuthConfig, windows_before
     """Confirma que el clic produjo navegacion real al SNE."""
     end_time = time.time() + cfg.timeout
     while time.time() < end_time:
-        windows_now = driver.window_handles
+        try:
+            windows_now = driver.window_handles
+        except Exception:
+            return False
 
         if len(windows_now) > len(windows_before) and _switch_to_sne_window_if_any(driver, cfg):
             return True
 
-        current_url = driver.current_url or ""
+        try:
+            current_url = driver.current_url or ""
+        except Exception:
+            return False
         if _normalize_text(cfg.sne_target_url) in _normalize_text(current_url):
             return True
 
@@ -2657,6 +2803,28 @@ def main() -> None:
         default=_env_bool("OSI_HEADLESS", True),
         help="Ejecuta Selenium en modo headless (env: OSI_HEADLESS)",
     )
+    parser.add_argument(
+        "--auto-backfill-start",
+        default=os.getenv("OSI_AUTO_BACKFILL_START", ""),
+        help="Fecha inicio YYYY-MM-DD para procesar por dias hasta --auto-backfill-end o hoy (env: OSI_AUTO_BACKFILL_START)",
+    )
+    parser.add_argument(
+        "--auto-backfill-end",
+        default=os.getenv("OSI_AUTO_BACKFILL_END", ""),
+        help="Fecha fin YYYY-MM-DD para backfill por dias (env: OSI_AUTO_BACKFILL_END)",
+    )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        default=_env_bool("OSI_DAEMON", False),
+        help="Ejecuta en bucle automatico mientras la maquina este encendida (env: OSI_DAEMON)",
+    )
+    parser.add_argument(
+        "--daemon-interval-minutes",
+        type=int,
+        default=int(os.getenv("OSI_DAEMON_INTERVAL_MINUTES", "60")),
+        help="Minutos entre ciclos en modo daemon (env: OSI_DAEMON_INTERVAL_MINUTES)",
+    )
     args = parser.parse_args()
 
     if not args.username or not args.password:
@@ -2700,9 +2868,49 @@ def main() -> None:
     session = requests.Session()
     session.headers.update({"User-Agent": cfg.user_agent})
 
+    def _run_for_single_day(day: datetime) -> None:
+        day_ddmmyyyy = day.strftime("%d/%m/%Y")
+        day_cfg = replace(
+            cfg,
+            fecha_notificacion_inicio=day_ddmmyyyy,
+            fecha_notificacion_fin=day_ddmmyyyy,
+            incremental_only=True,
+            skip_existing_notifications=True,
+        )
+        logging.info("Procesando dia %s en modo automatico.", day.strftime("%Y-%m-%d"))
+        login(session, day_cfg, args.username, args.password)
+
+    def _run_backfill_range(start_day: datetime, end_day: datetime) -> None:
+        current = start_day
+        while current <= end_day:
+            _run_for_single_day(current)
+            current = current + timedelta(days=1)
+
     try:
-        login(session, cfg, args.username, args.password)
-        print("Autenticacion completada correctamente.")
+        backfill_start = _parse_iso_date(args.auto_backfill_start)
+        backfill_end = _parse_iso_date(args.auto_backfill_end) or datetime.now()
+
+        if backfill_start is not None:
+            if backfill_start > backfill_end:
+                raise RuntimeError("--auto-backfill-start no puede ser mayor que --auto-backfill-end.")
+            _run_backfill_range(backfill_start, backfill_end)
+            print("Backfill completado correctamente.")
+
+        if args.daemon:
+            interval_seconds = max(60, args.daemon_interval_minutes * 60)
+            logging.info("Modo daemon activo. Intervalo: %s minutos.", interval_seconds // 60)
+            while True:
+                today = datetime.now()
+                try:
+                    _run_for_single_day(today)
+                    logging.info("Ciclo automatico completado para %s.", today.strftime("%Y-%m-%d"))
+                except Exception as exc:
+                    logging.warning("Fallo en ciclo automatico: %s", exc)
+                time.sleep(interval_seconds)
+
+        if backfill_start is None and not args.daemon:
+            login(session, cfg, args.username, args.password)
+            print("Autenticacion completada correctamente.")
     except KeyboardInterrupt:
         print("Ejecucion interrumpida por el usuario.")
 

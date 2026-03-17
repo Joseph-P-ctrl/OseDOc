@@ -3,12 +3,14 @@ from __future__ import annotations
 import html
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import threading
 import time
 import unicodedata
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -41,8 +43,6 @@ def _load_dotenv(dotenv_path: Path) -> None:
 
 
 _load_dotenv(WORKSPACE_DIR / ".env")
-
-app = FastAPI(title="OsiDOc Viewer", version="1.0.0")
 
 _DOWNLOADS_ENV = os.getenv("OSI_DOWNLOAD_DIR", "downloads")
 DOWNLOADS_DIR = Path(_DOWNLOADS_ENV)
@@ -106,6 +106,18 @@ def _auto_sync_loop() -> None:
       pass
 
 
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+  """Limpia cache al arranque y lanza el refresco periodico sin usar eventos deprecados."""
+  _build_notification_files_metadata.cache_clear()
+  scheduler = threading.Thread(target=_auto_sync_loop, daemon=True)
+  scheduler.start()
+  yield
+
+
+app = FastAPI(title="OsiDOc Viewer", version="1.0.0", lifespan=_app_lifespan)
+
+
 def _run_update(target_date: str | None = None):
   """Ejecuta osinergmin_auth.py para una fecha exacta (sin mezclar dias)."""
   try:
@@ -167,15 +179,6 @@ def _run_update(target_date: str | None = None):
     _build_notification_files_metadata.cache_clear()
     UPDATE_STATE["running"] = False
     UPDATE_STATE["started_at"] = None
-
-
-@app.on_event("startup")
-async def _auto_sync_on_startup():
-  """Limpia cache al arranque y lanza el scheduler periodico de refresco de cache."""
-  _build_notification_files_metadata.cache_clear()
-  scheduler = threading.Thread(target=_auto_sync_loop, daemon=True)
-  scheduler.start()
-
 
 def _connect() -> sqlite3.Connection:
     con = sqlite3.connect(str(DB_PATH))
@@ -1094,14 +1097,15 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     .btn.stats-btn:hover {{ background: linear-gradient(110deg, #5a3fb8, #7a5bd0); }}
     .stats-modal-content {{
       background: var(--card);
-      border-radius: 16px;
-      padding: 36px 40px;
+      border-radius: 22px;
+      padding: 30px 32px 24px;
       box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-      max-width: 560px;
+      max-width: 860px;
       width: 95%;
       animation: slideUp 0.3s ease;
+      border: 1px solid rgba(0, 87, 184, 0.08);
     }}
-    .stats-modal-content h2 {{ margin: 0 0 20px; color: var(--ink); font-size: 20px; }}
+    .stats-modal-content h2 {{ margin: 0 0 18px; color: var(--ink); font-size: 22px; }}
     .stats-close {{
       float: right;
       background: transparent;
@@ -1114,14 +1118,160 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     }}
     .stats-close:hover {{ color: var(--ink); background: transparent; transform: none; box-shadow: none; }}
     .stats-loading {{ text-align: center; color: var(--muted); padding: 30px 0; }}
-    .stats-table {{ width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 4px; }}
-    .stats-table th, .stats-table td {{ border-bottom: 1px solid var(--line); padding: 10px 12px; text-align: left; }}
-    .stats-table th {{ background: var(--accent); color: #0b3f76; font-weight: 700; position: sticky; top: 0; }}
-    .stats-table tr:last-child td {{ border-bottom: 0; }}
-    .stats-table .count-cell {{ text-align: right; font-weight: 700; color: var(--brand); }}
-    .stats-bar-wrap {{ background: #e8f0fb; border-radius: 999px; height: 8px; min-width: 80px; overflow: hidden; display: inline-block; vertical-align: middle; width: 120px; margin-left: 8px; }}
-    .stats-bar {{ height: 100%; background: linear-gradient(90deg, #0057b8, #0284c7); border-radius: 999px; transition: width 0.4s ease; }}
-    .stats-total {{ margin-top: 16px; font-size: 13px; color: var(--muted); text-align: right; }}
+    .stats-shell {{ display: grid; gap: 18px; }}
+    .stats-hero {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.25fr) minmax(280px, 0.85fr);
+      gap: 18px;
+      align-items: stretch;
+    }}
+    .stats-hero-copy {{
+      border: 1px solid #d9e6f4;
+      border-radius: 18px;
+      padding: 18px 20px;
+      background:
+        radial-gradient(circle at top left, rgba(0, 166, 251, 0.18), transparent 34%),
+        linear-gradient(135deg, #f8fbff 0%, #eef5ff 100%);
+    }}
+    .stats-caption {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #35679b;
+      margin-bottom: 10px;
+    }}
+    .stats-caption::before {{
+      content: '';
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #0057b8, #00a6fb);
+      box-shadow: 0 0 0 4px rgba(0, 166, 251, 0.12);
+    }}
+    .stats-hero-copy h3 {{ margin: 0; font-size: 28px; line-height: 1.05; color: #0b2f57; }}
+    .stats-hero-copy p {{ margin: 10px 0 0; font-size: 13px; line-height: 1.55; color: #56708f; max-width: 58ch; }}
+    .stats-chip-row {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }}
+    .stats-chip {{
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      border: 1px solid #cfe0f3;
+      background: rgba(255,255,255,0.82);
+      color: #184a7a;
+    }}
+    .stats-donut-card {{
+      border: 1px solid #d9e6f4;
+      border-radius: 18px;
+      background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      gap: 14px;
+    }}
+    .stats-donut-wrap {{ position: relative; width: 220px; height: 220px; display: grid; place-items: center; }}
+    .stats-donut {{
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      position: relative;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.55), 0 16px 32px rgba(0, 60, 128, 0.12);
+    }}
+    .stats-donut::after {{
+      content: '';
+      position: absolute;
+      inset: 18px;
+      border-radius: 50%;
+      background: linear-gradient(180deg, #ffffff 0%, #f4f8fd 100%);
+      box-shadow: inset 0 0 0 1px #d7e4f4;
+    }}
+    .stats-donut-center {{ position: absolute; z-index: 1; display: grid; justify-items: center; text-align: center; gap: 4px; }}
+    .stats-donut-total {{ font-size: 42px; line-height: 1; font-weight: 800; color: #0b2f57; }}
+    .stats-donut-label {{ font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #5f7794; }}
+    .stats-donut-sub {{ font-size: 12px; color: #5f7794; }}
+    .stats-kpi-grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }}
+    .stats-kpi-card {{ border-radius: 16px; padding: 14px 16px; color: #fff; box-shadow: 0 16px 26px rgba(13, 37, 75, 0.12); }}
+    .stats-kpi-card:nth-child(1) {{ background: linear-gradient(135deg, #0057b8, #1c88ff); }}
+    .stats-kpi-card:nth-child(2) {{ background: linear-gradient(135deg, #0f9f69, #42c98b); }}
+    .stats-kpi-card:nth-child(3) {{ background: linear-gradient(135deg, #ff7a59, #ffb347); }}
+    .stats-kpi-card:nth-child(4) {{ background: linear-gradient(135deg, #6a4fc8, #9a7cff); }}
+    .stats-kpi-label {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.09em; opacity: 0.86; }}
+    .stats-kpi-value {{ font-size: 26px; font-weight: 800; margin-top: 6px; line-height: 1; }}
+    .stats-kpi-note {{ font-size: 12px; margin-top: 6px; opacity: 0.9; }}
+    .stats-detail-grid {{ display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(260px, 0.85fr); gap: 14px; }}
+    .stats-panel {{
+      border: 1px solid #d9e6f4;
+      border-radius: 18px;
+      background: #ffffff;
+      padding: 16px;
+      box-shadow: 0 10px 24px rgba(12, 34, 60, 0.06);
+    }}
+    .stats-panel-title {{ font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; color: #537395; margin-bottom: 14px; }}
+    .stats-chart {{ display: grid; gap: 12px; margin-top: 4px; }}
+    .stats-row {{
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #f9fbff;
+      padding: 12px 14px;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.65);
+    }}
+    .stats-row-head {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      font-size: 14px;
+      color: #0b3f76;
+      font-weight: 600;
+    }}
+    .stats-row-head strong {{ color: #083f82; }}
+    .stats-row-meta {{ font-size: 12px; color: #6982a0; margin-top: 8px; }}
+    .stats-track {{
+      width: 100%;
+      height: 14px;
+      border-radius: 999px;
+      background: #e8f0fb;
+      overflow: hidden;
+    }}
+    .stats-fill {{
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #0057b8, #0284c7);
+      transition: width 0.45s ease;
+      box-shadow: inset 0 -1px 0 rgba(255,255,255,0.22);
+    }}
+    .stats-legend {{ display: grid; gap: 10px; }}
+    .stats-legend-item {{
+      display: grid;
+      grid-template-columns: 14px minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: #f7fbff;
+      border: 1px solid #e0ebf8;
+    }}
+    .stats-legend-swatch {{ width: 14px; height: 14px; border-radius: 4px; }}
+    .stats-legend-label {{ font-size: 13px; color: #28476b; font-weight: 700; }}
+    .stats-legend-value {{ font-size: 12px; color: #5f7794; font-weight: 700; }}
+    .stats-total {{ margin-top: 8px; font-size: 13px; color: var(--muted); text-align: right; font-weight: 700; }}
+    @media (max-width: 860px) {{
+      .stats-modal-content {{ padding: 22px 18px 20px; }}
+      .stats-hero {{ grid-template-columns: 1fr; }}
+      .stats-detail-grid {{ grid-template-columns: 1fr; }}
+      .stats-kpi-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .stats-donut-wrap {{ width: 190px; height: 190px; }}
+      .stats-hero-copy h3 {{ font-size: 24px; }}
+    }}
+    @media (max-width: 560px) {{
+      .stats-kpi-grid {{ grid-template-columns: 1fr; }}
+    }}
   </style>
 </head>
 <body>
@@ -1364,6 +1514,22 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       }}
     }})();
 
+    function _escapeHtml(value) {{
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }}
+
+    function _formatStatsDate(value) {{
+      if (!value) return 'Fecha analizada';
+      const d = new Date(`${{value}}T00:00:00`);
+      if (Number.isNaN(d.getTime())) return 'Fecha analizada';
+      return d.toLocaleDateString('es-PE', {{ day: '2-digit', month: 'long', year: 'numeric' }});
+    }}
+
     async function abrirEstadisticas() {{
       const modal = document.getElementById('statsModal');
       const body = document.getElementById('statsBody');
@@ -1379,13 +1545,65 @@ def _html_page(title: str, body: str) -> HTMLResponse:
           body.innerHTML = '<div class="stats-loading">No hay datos disponibles.</div>';
           return;
         }}
+        const palette = ['#0057b8', '#00a6fb', '#ff7a59', '#7c3aed', '#16a34a', '#f59e0b', '#ef4444', '#14b8a6'];
         const maxCount = items[0].count || 1;
-        const rows = items.map((item) => {{
-          const pct = Math.round((item.count / maxCount) * 100);
-          return `<tr><td>${{item.tipo}}</td><td class="count-cell">${{item.count}}<span class="stats-bar-wrap"><span class="stats-bar" style="width:${{pct}}%"></span></span></td></tr>`;
+        const leader = items[0];
+        const totalSafe = total || items.reduce((sum, item) => sum + (item.count || 0), 0);
+        let cumulative = 0;
+        const donutStops = items.map((item, index) => {{
+          const color = palette[index % palette.length];
+          const portion = totalSafe > 0 ? (item.count / totalSafe) * 100 : 0;
+          const start = cumulative;
+          cumulative += portion;
+          return `${{color}} ${{start}}% ${{cumulative}}%`;
+        }}).join(', ');
+        const rows = items.map((item, index) => {{
+          const pct = Math.max(4, Math.round((item.count / maxCount) * 100));
+          const share = totalSafe > 0 ? Math.round((item.count / totalSafe) * 100) : 0;
+          const color = palette[index % palette.length];
+          return `<div class="stats-row"><div class="stats-row-head"><span>${{_escapeHtml(item.tipo)}}</span><strong>${{item.count}}</strong></div><div class="stats-track"><div class="stats-fill" style="width:${{pct}}%; background:linear-gradient(90deg, ${{color}}, #8fd3ff)"></div></div><div class="stats-row-meta">Representa el ${{share}}% del total del día.</div></div>`;
         }}).join('');
-        body.innerHTML = `<div class="table-wrap" style="max-height:55vh"><table class="stats-table"><thead><tr><th>Tipo de documento</th><th style="text-align:right">Cantidad</th></tr></thead><tbody>${{rows}}</tbody></table></div>`;
-        totalEl.textContent = `Total: ${{total}} notificaci&#243;n(es) en ${{items.length}} tipo(s)`;
+        const legend = items.map((item, index) => {{
+          const color = palette[index % palette.length];
+          const share = totalSafe > 0 ? Math.round((item.count / totalSafe) * 100) : 0;
+          return `<div class="stats-legend-item"><span class="stats-legend-swatch" style="background:${{color}}"></span><span class="stats-legend-label">${{_escapeHtml(item.tipo)}}</span><span class="stats-legend-value">${{item.count}} · ${{share}}%</span></div>`;
+        }}).join('');
+        body.innerHTML = `
+          <div class="stats-shell">
+            <div class="stats-hero">
+              <div class="stats-hero-copy">
+                <div class="stats-caption">Panel Ejecutivo</div>
+                <h3>${{_formatStatsDate(data.target_date)}}</h3>
+                <p>Resumen visual de la distribución documental del día, con predominancia, composición y peso relativo por cada categoría identificada.</p>
+                <div class="stats-chip-row">
+                  <span class="stats-chip">${{totalSafe}} registros evaluados</span>
+                  <span class="stats-chip">${{items.length}} tipo(s) detectado(s)</span>
+                  <span class="stats-chip">Líder: ${{_escapeHtml(leader.tipo)}}</span>
+                </div>
+              </div>
+              <div class="stats-donut-card">
+                <div class="stats-donut-wrap">
+                  <div class="stats-donut" style="background: conic-gradient(${{donutStops}})"></div>
+                  <div class="stats-donut-center">
+                    <span class="stats-donut-total">${{totalSafe}}</span>
+                    <span class="stats-donut-label">notificación</span>
+                    <span class="stats-donut-sub">Composición total</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="stats-kpi-grid">
+              <div class="stats-kpi-card"><div class="stats-kpi-label">Total</div><div class="stats-kpi-value">${{totalSafe}}</div><div class="stats-kpi-note">Carga documental del día</div></div>
+              <div class="stats-kpi-card"><div class="stats-kpi-label">Tipo líder</div><div class="stats-kpi-value">${{_escapeHtml(leader.tipo)}}</div><div class="stats-kpi-note">${{leader.count}} registros</div></div>
+              <div class="stats-kpi-card"><div class="stats-kpi-label">Participación líder</div><div class="stats-kpi-value">${{totalSafe > 0 ? Math.round((leader.count / totalSafe) * 100) : 0}}%</div><div class="stats-kpi-note">Peso sobre el total</div></div>
+              <div class="stats-kpi-card"><div class="stats-kpi-label">Diversidad</div><div class="stats-kpi-value">${{items.length}}</div><div class="stats-kpi-note">Familias documentales</div></div>
+            </div>
+            <div class="stats-detail-grid">
+              <div class="stats-panel"><div class="stats-panel-title">Distribución Comparativa</div><div class="stats-chart">${{rows}}</div></div>
+              <div class="stats-panel"><div class="stats-panel-title">Composición por Tipo</div><div class="stats-legend">${{legend}}</div></div>
+            </div>
+          </div>`;
+        totalEl.textContent = `Total: ${{total}} notificación`;
       }} catch (e) {{
         body.innerHTML = '<div class="stats-loading">No se pudo cargar las estad&#237;sticas.</div>';
       }}
@@ -1822,4 +2040,26 @@ def serve_file(file_path: str):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("web_app:app", host="127.0.0.1", port=8000, reload=False)
+    def _is_port_available(host: str, port: int) -> bool:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+    def _pick_startup_port(host: str) -> int:
+        for candidate in (8000, 8010, 8765, 8020, 8011):
+            if _is_port_available(host, candidate):
+                return candidate
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, 0))
+            return int(s.getsockname()[1])
+
+    host = "127.0.0.1"
+    selected_port = _pick_startup_port(host)
+    print(f"Iniciando OsiDOc Viewer en http://{host}:{selected_port}/")
+
+    uvicorn.run("web_app:app", host=host, port=selected_port, reload=False)

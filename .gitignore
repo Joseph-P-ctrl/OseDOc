@@ -11,3 +11,9 @@ wheels/
 
 # Local secrets
 .env
+
+# Datos locales (documentos descargados, BD SQLite, Excel exportados)
+downloads/*.db
+downloads/*.xlsx
+downloads/*/
+
